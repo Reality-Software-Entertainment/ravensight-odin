@@ -9,9 +9,9 @@ side kill switch, in one Odin package pumped from your main loop.
 * Docs: https://ravensight.io/docs/
 * Odin: a current release (tested against `dev-2026-08`)
 
-## BETA notice
+## Verification status
 
-This package is a beta. The protocol logic in `core.odin` is written and
+The protocol logic in `core.odin` is written and
 reviewed against the live API contract, is a pure state machine with no
 network or clock access, and is covered by unit tests that drive every retry
 path deterministically (`odin test ravensight`). The curl transport has been
