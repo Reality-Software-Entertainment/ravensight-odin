@@ -7,6 +7,7 @@ side kill switch, in one Odin package pumped from your main loop.
 
 * API base: `https://api.ravensight.io/api/v1`
 * Docs: https://ravensight.io/docs/
+* Privacy: a random per-install device id, no advertising identifier, a local opt-out (`set_enabled(client, false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: a current release (tested against `dev-2026-08`)
 
 ## Verification status
@@ -201,6 +202,16 @@ data and pass it back via `Config.device_id`.
 
 `set_enabled(client, false)` stops all sending and discards anything still
 queued, so an opt out does not leave player data sitting in memory.
+
+The opt-out is not stored by the SDK: keep the player's choice in your own
+settings and call `set_enabled(client, false)` before the first event on every
+launch. To forget this install's analytics identity, stop passing the saved `device_id` (with none set the id is new every run);
+the next run starts under a fresh id and nothing links the old one back.
+
+A game that sends gameplay events and nothing else can declare Device ID and
+Product Interaction as not linked to the player and not used for tracking,
+and needs no tracking permission prompt. The row by row answers for the App
+Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
 ## License
 
