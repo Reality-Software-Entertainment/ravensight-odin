@@ -1,8 +1,9 @@
 // core.odin - the Ravensight protocol as a pure state machine.
 //
 // Everything that decides WHAT to send and WHEN lives here: the offline
-// queue, batching, the server kill switch, session lifetime, 401 re-auth,
-// 429 Retry-After, exponential backoff and oversize batch splitting.
+// queue, batching, the server kill switch, the player's opt-out, a refused
+// ingest key, a closed playtest run, session lifetime, 401 re-auth, 429 and
+// 503 Retry-After, exponential backoff and oversize batch splitting.
 //
 // This file performs no I/O and never reads a clock. Time always arrives as
 // a `now_ms` argument and network answers arrive as `Core_Response` values,
@@ -32,6 +33,42 @@ EXPIRY_SKEW_MS :: 5_000
 // Consecutive 401-driven re-auths tolerated before backing off, so a server
 // that rejects every fresh token cannot cause a hot request loop.
 MAX_REAUTH_STREAK :: 2
+
+// Why the client is not sending, in the vocabulary every Ravensight SDK
+// shares. .None means nothing is wrong (ready, or not yet asked).
+Reason :: enum {
+	None,
+	Disabled,            // constructed disabled, set_enabled(false) or the player's opt-out
+	Invalid_Key,         // 401, or a 403 that is not one of the codes below
+	Tracking_Disabled,   // server kill switch, from /settings or a 403 tracking_disabled
+	Offline,             // no answer, a timeout, or a 5xx on a batch
+	Rate_Limited,        // 429
+	Session_Failed,      // POST /session failed, or the playtest token is unusable
+	Playtest_Job_Closed, // 403 playtest_job_closed
+}
+
+// The wire form of a Reason, e.g. "invalid_key". "" for .None.
+reason_string :: proc(r: Reason) -> string {
+	switch r {
+	case .None:
+		return ""
+	case .Disabled:
+		return "disabled"
+	case .Invalid_Key:
+		return "invalid_key"
+	case .Tracking_Disabled:
+		return "tracking_disabled"
+	case .Offline:
+		return "offline"
+	case .Rate_Limited:
+		return "rate_limited"
+	case .Session_Failed:
+		return "session_failed"
+	case .Playtest_Job_Closed:
+		return "playtest_job_closed"
+	}
+	return ""
+}
 
 Core_Event :: struct {
 	name:        string, // owned by the core
@@ -81,6 +118,9 @@ Signals :: struct {
 	events_flushed:    int, // > 0 when a batch was accepted
 	flush_failed:      bool,
 	event_dropped:     bool, // a single event was rejected with 400 and dropped
+	key_refused:       bool, // the ingest key was refused; automatic sending stopped
+	stopped:           bool, // permanent stop for the run (playtest token refused or closed)
+	settings_failed:   bool, // GET /settings had no usable answer; tracking assumed on
 	reason:            string,
 }
 
@@ -96,9 +136,15 @@ Core :: struct {
 	max_queue:             int,
 	flush_interval_ms:     i64, // < 0 disables the timer (explicit flush only)
 
-	enabled:               bool, // local opt-out (privacy toggle)
+	enabled:               bool, // construction option and set_enabled; never saved
+	opted_out:             bool, // the player's saved choice (set_tracking_enabled)
 	settings_checked:      bool,
 	tracking_enabled:      bool, // server kill switch, assumed on until checked
+	stopped:               bool, // permanent for the run
+	stop_reason:           Reason,
+	key_refused:           bool, // automatic requests stop; flush() allows one attempt
+	one_attempt:           bool,
+	last_failure:          Reason,
 
 	session_token:         string, // owned
 	session_expires_at_ms: i64,
@@ -106,6 +152,12 @@ Core :: struct {
 
 	in_flight:             Request_Kind,
 	in_flight_batch:       int,
+	// Bumped whenever the queue is discarded or the session is dropped, so
+	// an answer to a request sent before that cannot touch the new state.
+	queue_gen:             int,
+	in_flight_queue_gen:   int,
+	session_gen:           int,
+	in_flight_session_gen: int,
 
 	queue:                 [dynamic]Core_Event,
 	backoff_ms:            i64,
@@ -140,25 +192,98 @@ core_destroy :: proc(c: ^Core) {
 	}
 }
 
+// active = enabled && !opted_out && server tracking on && not stopped.
+// While not active nothing touches the network.
 core_is_active :: proc(c: ^Core) -> bool {
-	return c.enabled && c.tracking_enabled
+	return c.enabled && !c.opted_out && c.tracking_enabled && !c.stopped
+}
+
+// The current reason in the shared vocabulary, most permanent cause first.
+core_reason :: proc(c: ^Core) -> Reason {
+	if !c.enabled || c.opted_out {
+		return .Disabled
+	}
+	if c.stopped {
+		return c.stop_reason
+	}
+	if !c.tracking_enabled {
+		return .Tracking_Disabled
+	}
+	if c.key_refused {
+		return .Invalid_Key
+	}
+	return c.last_failure
 }
 
 core_is_session_valid :: proc(c: ^Core, now_ms: i64) -> bool {
 	return len(c.session_token) > 0 && now_ms < c.session_expires_at_ms - EXPIRY_SKEW_MS
 }
 
-// Local opt-in and opt-out. Disabling discards anything still queued so an
-// opt-out does not leave player data sitting in memory.
+// The runtime switch (not saved). Disabling discards anything still queued
+// so it does not leave player data sitting in memory.
 core_set_enabled :: proc(c: ^Core, enabled: bool) {
 	if c.enabled == enabled {
 		return
 	}
 	c.enabled = enabled
 	if !enabled {
-		c.stats.dropped += len(c.queue)
-		core_clear_queue(c)
+		core_discard_queue(c)
 	}
+}
+
+// The player's choice. Opting out discards the queue and stops the timer.
+// Saving it is the client layer's job.
+core_set_opted_out :: proc(c: ^Core, opted_out: bool) {
+	if c.opted_out == opted_out {
+		return
+	}
+	c.opted_out = opted_out
+	if opted_out {
+		core_discard_queue(c)
+	}
+}
+
+// Stops the client for the rest of the run: queue cleared, no request ever
+// again. Used for a playtest token the server refused or a closed run.
+core_stop :: proc(c: ^Core, reason: Reason) {
+	if c.stopped {
+		return
+	}
+	c.stopped = true
+	c.stop_reason = reason
+	core_discard_queue(c)
+}
+
+// The server kill switch: tracking off for the rest of the run.
+core_kill :: proc(c: ^Core) {
+	c.tracking_enabled = false
+	core_discard_queue(c)
+}
+
+// Forgets the current session; the next event opens a new one. An answer
+// to a session request already in flight is ignored.
+core_invalidate_session :: proc(c: ^Core) {
+	if len(c.session_token) > 0 {
+		delete(c.session_token, c.allocator)
+		c.session_token = ""
+	}
+	c.session_expires_at_ms = 0
+	c.session_gen += 1
+	c.reauth_streak = 0
+}
+
+// After the key was refused, flush() lets exactly one more request out.
+core_allow_one_attempt :: proc(c: ^Core) {
+	if c.key_refused {
+		c.one_attempt = true
+	}
+}
+
+// Drops everything queued, counting it as dropped.
+core_discard_queue :: proc(c: ^Core) {
+	c.stats.dropped += len(c.queue)
+	core_clear_queue(c)
+	c.session_wanted = false
 }
 
 // Queues one event. `data_json` must be a serialized JSON object ("" is
@@ -212,17 +337,19 @@ core_want_session :: proc(c: ^Core) {
 // is in flight at a time; calling this marks the returned request as in
 // flight until core_on_response is called.
 core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
-	if c.in_flight != .None || !c.enabled {
+	if c.in_flight != .None || !core_is_active(c) {
+		return
+	}
+	// A refused key stops automatic requests; flush() allows one attempt.
+	if c.key_refused && !c.one_attempt {
 		return
 	}
 
 	// Boot: read the server kill switch exactly once, before anything else.
 	if !c.settings_checked {
 		c.in_flight = .Settings
+		c.one_attempt = false
 		return Core_Request{kind = .Settings}, true
-	}
-	if !c.tracking_enabled {
-		return
 	}
 
 	if len(c.queue) == 0 {
@@ -237,16 +364,21 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 	if !core_is_session_valid(c, now_ms) {
 		if len(c.queue) > 0 || c.session_wanted {
 			c.in_flight = .Session
+			c.in_flight_session_gen = c.session_gen
+			c.one_attempt = false
 			return Core_Request{kind = .Session}, true
 		}
+		c.one_attempt = false
 		return
 	}
 
 	want_flush := len(c.queue) > 0 &&
 		(c.flush_requested ||
+				c.one_attempt ||
 			len(c.queue) >= MAX_BATCH_SIZE ||
 			(c.flush_interval_ms >= 0 && c.next_flush_at_ms > 0 && now_ms >= c.next_flush_at_ms))
 	if !want_flush {
+		c.one_attempt = false
 		return
 	}
 
@@ -254,6 +386,8 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 	body := build_batch_body(c.queue[:n], c.allocator)
 	c.in_flight = .Batch
 	c.in_flight_batch = n
+	c.in_flight_queue_gen = c.queue_gen
+	c.one_attempt = false
 	return Core_Request{kind = .Batch, body = body, batch_len = n}, true
 }
 
@@ -267,21 +401,36 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 		return
 	case .Settings:
 		c.settings_checked = true
-		if res.status == 200 && res.has_tracking_enabled {
-			c.tracking_enabled = res.tracking_enabled
-		} else {
+		switch {
+		case res.status == 200 && res.has_tracking_enabled:
+			if !res.tracking_enabled {
+				core_kill(c)
+				sig.tracking_disabled = true
+				sig.reason = "tracking_disabled"
+			}
+		case res.status == 401 || res.status == 403:
+			core_apply_refusal(c, res.status, res.error_code, &sig)
+		case:
 			// Unreachable or malformed: assume tracking is on, so a
 			// settings outage does not silently lose a session.
-			c.tracking_enabled = true
-		}
-		if !c.tracking_enabled {
-			core_clear_queue(c)
-			sig.tracking_disabled = true
-			sig.reason = "server"
+			if res.status == 0 {
+				c.last_failure = .Offline
+			}
+			sig.settings_failed = true
+			sig.reason = res.error_code
 		}
 	case .Session:
 		c.session_wanted = false
-		if res.status == 201 && len(res.token) > 0 {
+		if c.in_flight_session_gen != c.session_gen {
+			// The session was dropped (reset_device_id) while this was in
+			// flight. Whatever it says belongs to the old identity.
+			if res.status == 401 || res.status == 403 {
+				core_apply_refusal(c, res.status, res.error_code, &sig)
+			}
+			return
+		}
+		switch {
+		case res.status == 201 && len(res.token) > 0:
 			if len(c.session_token) > 0 {
 				delete(c.session_token, c.allocator)
 			}
@@ -294,20 +443,42 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 				c.session_expires_at_ms = now_ms + DEFAULT_SESSION_TTL_MS
 			}
 			c.stats.sessions += 1
+			c.key_refused = false
+			c.last_failure = .None
 			core_reset_backoff(c)
 			sig.session_ready = true
-		} else if res.status == 429 {
+		case res.status == 401 || res.status == 403:
+			core_apply_refusal(c, res.status, res.error_code, &sig)
+			sig.session_failed = true
+			sig.reason = reason_string(core_reason(c))
+		case res.status == 429:
 			core_apply_retry_after(c, res, now_ms)
+			c.last_failure = .Rate_Limited
 			sig.session_failed = true
-			sig.reason = len(res.error_code) > 0 ? res.error_code : "rate_limited"
-		} else {
+			sig.reason = "rate_limited"
+		case res.status == 0:
 			core_schedule_backoff(c, now_ms)
+			c.last_failure = .Offline
 			sig.session_failed = true
-			sig.reason = len(res.error_code) > 0 ? res.error_code : "session_failed"
+			sig.reason = "offline"
+		case:
+			// 201 without a token, 503 storage_unavailable, any other 5xx.
+			core_apply_retry_after(c, res, now_ms)
+			c.last_failure = .Session_Failed
+			sig.session_failed = true
+			sig.reason = "session_failed"
 		}
 	case .Batch:
 		n := c.in_flight_batch
 		c.in_flight_batch = 0
+		if c.in_flight_queue_gen != c.queue_gen {
+			// The queue this batch came from was discarded since it went
+			// out (opt-out, reset, kill switch); its answer changes nothing.
+			if res.status == 403 {
+				core_apply_refusal(c, res.status, res.error_code, &sig)
+			}
+			return
+		}
 
 		switch {
 		case res.status == 202:
@@ -321,6 +492,7 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			c.stats.flushes += 1
 			c.batch_limit = MAX_BATCH_SIZE
 			c.reauth_streak = 0
+			c.last_failure = .None
 			core_reset_backoff(c)
 			if len(c.queue) > 0 {
 				// Keep draining until the queue is empty.
@@ -345,10 +517,15 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 				core_schedule_backoff(c, now_ms)
 			}
 			c.flush_requested = true
+		case res.status == 403:
+			core_apply_refusal(c, res.status, res.error_code, &sig)
+			sig.flush_failed = true
+			sig.reason = reason_string(core_reason(c))
 		case res.status == 429:
 			core_apply_retry_after(c, res, now_ms)
+			c.last_failure = .Rate_Limited
 			sig.flush_failed = true
-			sig.reason = len(res.error_code) > 0 ? res.error_code : "rate_limited"
+			sig.reason = "rate_limited"
 		case res.status == 400:
 			if n > 1 {
 				// Batch rejected as oversize: halve and retry immediately.
@@ -367,13 +544,57 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 				c.flush_requested = len(c.queue) > 0
 				sig.event_dropped = true
 			}
-		case:
+		case res.status == 0:
 			core_schedule_backoff(c, now_ms)
+			c.last_failure = .Offline
+			sig.flush_failed = true
+			sig.reason = "offline"
+		case:
+			// 5xx, including 503 storage_unavailable with its Retry-After.
+			core_apply_retry_after(c, res, now_ms)
+			c.last_failure = .Offline
 			sig.flush_failed = true
 			sig.reason = len(res.error_code) > 0 ? res.error_code : "flush_failed"
 		}
 	}
 	return
+}
+
+// Applies a 401 or 403 from any endpoint (except a 401 on a batch, which
+// means the session expired and is handled by re-auth):
+//   403 tracking_disabled       kill switch for the run, queue cleared
+//   403 invalid_playtest_token  stop for the run, reason session_failed
+//   403 playtest_job_closed     stop for the run, reason playtest_job_closed
+//   any other 401 or 403        the key was refused: automatic requests stop,
+//                               the queue is kept, flush() tries once more
+core_apply_refusal :: proc(c: ^Core, status: int, error_code: string, sig: ^Signals) {
+	if status == 403 {
+		switch error_code {
+		case "tracking_disabled":
+			if c.tracking_enabled {
+				core_kill(c)
+				sig.tracking_disabled = true
+			}
+			return
+		case "invalid_playtest_token":
+			if !c.stopped {
+				core_stop(c, .Session_Failed)
+				sig.stopped = true
+			}
+			return
+		case "playtest_job_closed":
+			if !c.stopped {
+				core_stop(c, .Playtest_Job_Closed)
+				sig.stopped = true
+			}
+			return
+		}
+	}
+	if !c.key_refused {
+		c.key_refused = true
+		sig.key_refused = true
+	}
+	c.one_attempt = false
 }
 
 // --- Backoff -----------------------------------------------------------------
@@ -405,6 +626,10 @@ core_clear_queue :: proc(c: ^Core) {
 		delete(evt.data_json, c.allocator)
 	}
 	clear(&c.queue)
+	c.queue_gen += 1
+	c.flush_requested = false
+	c.next_flush_at_ms = 0
+	c.batch_limit = MAX_BATCH_SIZE
 }
 
 // --- Wire format --------------------------------------------------------------
@@ -466,15 +691,14 @@ write_json_string :: proc(b: ^strings.Builder, s: string) {
 }
 
 // Accepts a bare host or a full /api/v1 base and always returns the
-// versioned base with no trailing slash.
+// versioned base: trim whitespace, strip every trailing "/", strip a
+// trailing "/api/v1", then append "/api/v1". Empty means DEFAULT_API_URL.
 normalize_api_url :: proc(url: string, allocator := context.allocator) -> string {
 	raw := strings.trim_space(url)
 	raw = strings.trim_right(raw, "/")
 	if len(raw) == 0 {
-		raw = strings.trim_right(DEFAULT_API_URL, "/")
+		raw = DEFAULT_API_URL
 	}
-	if strings.has_suffix(raw, "/api/v1") {
-		return strings.clone(raw, allocator)
-	}
+	raw = strings.trim_suffix(raw, "/api/v1")
 	return strings.concatenate({raw, "/api/v1"}, allocator)
 }

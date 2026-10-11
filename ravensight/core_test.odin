@@ -455,6 +455,10 @@ test_normalize_api_url :: proc(t: ^testing.T) {
 	check(t, "https://api.ravensight.io/api/v1", "https://api.ravensight.io/api/v1")
 	check(t, "https://api.ravensight.io/api/v1/", "https://api.ravensight.io/api/v1")
 	check(t, "  https://self.hosted.example  ", "https://self.hosted.example/api/v1")
+	check(t, "   ", "https://api.ravensight.io/api/v1")
+	check(t, "https://api.ravensight.io///", "https://api.ravensight.io/api/v1")
+	check(t, "https://api.ravensight.io/api/v1///", "https://api.ravensight.io/api/v1")
+	check(t, "http://localhost:3000/api/v1", "http://localhost:3000/api/v1")
 }
 
 @(test)
@@ -472,4 +476,227 @@ test_feedback_wants_session :: proc(t: ^testing.T) {
 	testing.expect_value(t, req.kind, Request_Kind.Session)
 	core_on_response(&c, Core_Response{status = 201, token = "tok"}, T0)
 	testing.expect(t, !c.session_wanted)
+}
+
+// --- 0.2.0: refusals, reasons, opt-out, stale answers -------------------------
+
+@(test)
+test_settings_401_refuses_key_then_silence :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	track_n(&c, 3, T0)
+
+	req, ok := core_next(&c, T0)
+	testing.expect(t, ok)
+	testing.expect_value(t, req.kind, Request_Kind.Settings)
+	sig := core_on_response(&c, Core_Response{status = 401, error_code = "invalid_api_key"}, T0)
+	testing.expect(t, sig.key_refused)
+	testing.expect(t, !sig.settings_failed)
+	testing.expect_value(t, core_reason(&c), Reason.Invalid_Key)
+
+	// One request, then none, however long we wait; the queue is kept.
+	expect_no_request(t, &c, T0+1)
+	expect_no_request(t, &c, T0+10_000_000)
+	testing.expect_value(t, len(c.queue), 3)
+	testing.expect(t, core_track(&c, "still_queues", "", T0))
+
+	// An explicit flush allows exactly one more attempt.
+	core_allow_one_attempt(&c)
+	core_request_flush(&c)
+	req2, ok2 := core_next(&c, T0+2)
+	testing.expect(t, ok2)
+	testing.expect_value(t, req2.kind, Request_Kind.Session)
+	sig2 := core_on_response(&c, Core_Response{status = 401}, T0+2)
+	testing.expect(t, sig2.session_failed)
+	testing.expect(t, !sig2.key_refused) // already refused, not reported twice
+	expect_no_request(t, &c, T0+10_000_000)
+}
+
+@(test)
+test_key_refused_clears_when_a_session_opens :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 1, T0)
+
+	req, _ := core_next(&c, T0)
+	testing.expect_value(t, req.kind, Request_Kind.Session)
+	sig := core_on_response(&c, Core_Response{status = 403, error_code = "forbidden"}, T0)
+	testing.expect(t, sig.key_refused)
+	testing.expect_value(t, sig.reason, "invalid_key")
+	testing.expect_value(t, core_reason(&c), Reason.Invalid_Key)
+
+	core_allow_one_attempt(&c)
+	open_session(t, &c, T0+1)
+	testing.expect(t, !c.key_refused)
+	testing.expect_value(t, core_reason(&c), Reason.None)
+}
+
+@(test)
+test_session_403_tracking_disabled_stops :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 4, T0)
+
+	req, _ := core_next(&c, T0)
+	testing.expect_value(t, req.kind, Request_Kind.Session)
+	sig := core_on_response(&c, Core_Response{status = 403, error_code = "tracking_disabled"}, T0)
+	testing.expect(t, sig.tracking_disabled)
+	testing.expect(t, sig.session_failed)
+	testing.expect_value(t, sig.reason, "tracking_disabled")
+	testing.expect_value(t, len(c.queue), 0)
+	testing.expect(t, !core_is_active(&c))
+	testing.expect_value(t, core_reason(&c), Reason.Tracking_Disabled)
+	testing.expect(t, !core_track(&c, "later", "", T0))
+	expect_no_request(t, &c, T0+10_000_000)
+}
+
+@(test)
+test_settings_403_tracking_disabled_is_the_kill_switch :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	track_n(&c, 2, T0)
+	core_next(&c, T0)
+	sig := core_on_response(&c, Core_Response{status = 403, error_code = "tracking_disabled"}, T0)
+	testing.expect(t, sig.tracking_disabled)
+	testing.expect_value(t, len(c.queue), 0)
+	expect_no_request(t, &c, T0+10_000_000)
+}
+
+@(test)
+test_batch_403_playtest_job_closed_stops :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0)
+	track_n(&c, 5, T0)
+	core_request_flush(&c)
+
+	sig := step_batch(t, &c, T0, 6, Core_Response{status = 403, error_code = "playtest_job_closed"})
+	testing.expect(t, sig.stopped)
+	testing.expect_value(t, core_reason(&c), Reason.Playtest_Job_Closed)
+	testing.expect_value(t, len(c.queue), 0)
+	testing.expect(t, !core_track(&c, "later", "", T0))
+
+	// Permanent: even an explicit flush sends nothing.
+	core_allow_one_attempt(&c)
+	core_force_flush(&c)
+	expect_no_request(t, &c, T0+10_000_000)
+}
+
+@(test)
+test_session_403_invalid_playtest_token_stops :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 1, T0)
+	core_next(&c, T0)
+	sig := core_on_response(&c, Core_Response{status = 403, error_code = "invalid_playtest_token"}, T0)
+	testing.expect(t, sig.stopped)
+	testing.expect_value(t, core_reason(&c), Reason.Session_Failed)
+	expect_no_request(t, &c, T0+10_000_000)
+}
+
+@(test)
+test_503_honors_retry_after :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0)
+	core_request_flush(&c)
+	sig := step_batch(t, &c, T0, 1, Core_Response{status = 503, retry_after_ms = 60_000, error_code = "storage_unavailable"})
+	testing.expect(t, sig.flush_failed)
+	testing.expect_value(t, core_reason(&c), Reason.Offline)
+	expect_no_request(t, &c, T0+59_999)
+	req, ok := core_next(&c, T0+60_000)
+	testing.expect(t, ok)
+	testing.expect_value(t, req.kind, Request_Kind.Batch)
+	delete(req.body)
+
+	// On POST /session too.
+	c2 := core_make()
+	defer core_destroy(&c2)
+	boot(t, &c2, T0, with_session = false)
+	track_n(&c2, 1, T0)
+	core_next(&c2, T0)
+	sig2 := core_on_response(&c2, Core_Response{status = 503, retry_after_ms = 60_000}, T0)
+	testing.expect_value(t, sig2.reason, "session_failed")
+	expect_no_request(t, &c2, T0+59_999)
+	req2, ok2 := core_next(&c2, T0+60_000)
+	testing.expect(t, ok2)
+	testing.expect_value(t, req2.kind, Request_Kind.Session)
+}
+
+@(test)
+test_failure_reasons :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 1, T0)
+
+	core_next(&c, T0)
+	sig := core_on_response(&c, Core_Response{status = 0}, T0)
+	testing.expect_value(t, sig.reason, "offline")
+	testing.expect_value(t, core_reason(&c), Reason.Offline)
+
+	core_next(&c, T0+10_000)
+	sig = core_on_response(&c, Core_Response{status = 429, retry_after_ms = 5_000}, T0+10_000)
+	testing.expect_value(t, sig.reason, "rate_limited")
+	testing.expect_value(t, core_reason(&c), Reason.Rate_Limited)
+
+	open_session(t, &c, T0+15_000)
+	testing.expect_value(t, core_reason(&c), Reason.None)
+	testing.expect_value(t, reason_string(.Invalid_Key), "invalid_key")
+	testing.expect_value(t, reason_string(.None), "")
+}
+
+@(test)
+test_opted_out_sends_nothing :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	c.opted_out = true
+	testing.expect(t, !core_track(&c, "e", "", T0))
+	expect_no_request(t, &c, T0)
+	testing.expect_value(t, core_reason(&c), Reason.Disabled)
+
+	core_set_opted_out(&c, false)
+	req, ok := core_next(&c, T0)
+	testing.expect(t, ok)
+	testing.expect_value(t, req.kind, Request_Kind.Settings)
+}
+
+@(test)
+test_stale_batch_answer_after_clear_keeps_new_events :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0)
+	track_n(&c, 2, T0)
+	core_request_flush(&c)
+	req, ok := core_next(&c, T0)
+	testing.expect(t, ok)
+	delete(req.body)
+
+	// Opt-out and back in while the batch is in flight, then new events.
+	core_set_opted_out(&c, true)
+	core_set_opted_out(&c, false)
+	track_n(&c, 2, T0, "new")
+	core_on_response(&c, Core_Response{status = 202}, T0)
+	testing.expect_value(t, len(c.queue), 2)
+	testing.expect_value(t, c.queue[0].name, "new0")
+}
+
+@(test)
+test_stale_session_answer_is_ignored :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 1, T0)
+	req, _ := core_next(&c, T0)
+	testing.expect_value(t, req.kind, Request_Kind.Session)
+
+	core_invalidate_session(&c) // reset_device_id while the request is out
+	core_on_response(&c, Core_Response{status = 201, token = "old_identity"}, T0)
+	testing.expect_value(t, c.session_token, "")
+	req2, ok := core_next(&c, T0)
+	testing.expect(t, ok)
+	testing.expect_value(t, req2.kind, Request_Kind.Session)
 }
