@@ -264,11 +264,18 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 		cl.storage_path = len(config.storage_path) > 0 ? strings.clone(config.storage_path) : default_storage_path()
 		saved := load_identity(cl.storage_path)
 		cl.core.opted_out = !saved.tracking_enabled
-		if len(saved.device_id) > 0 {
+		if saved.unreadable {
+			// It may hold an opt-out: honour that for this run, keep the
+			// file, and use an id that is never saved. Only the player's own
+			// set_tracking_enabled or reset_device_id replaces the file.
+			cl.core.opted_out = true
+			cl.saved_device_id = generate_device_id(allocator)
+			log(cl, .Warning, "Ravensight: the storage file exists but could not be read; tracking is off for this run and the file was left as it is.")
+		} else if len(saved.device_id) > 0 {
 			cl.saved_device_id = saved.device_id
 		} else {
 			cl.saved_device_id = generate_device_id(allocator)
-			if !save_identity(cl.storage_path, Saved_Identity{cl.saved_device_id, saved.tracking_enabled}) {
+			if !save_identity(cl.storage_path, Saved_Identity{device_id = cl.saved_device_id, tracking_enabled = saved.tracking_enabled}) {
 				log(cl, .Warning, "Ravensight: could not save the device id; players will count as new each launch. Set Config.storage_path to a writable file.")
 			}
 		}
@@ -354,7 +361,7 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 		log(client, .Info, "Ravensight: set_tracking_enabled is ignored during a playtest run.")
 		return
 	}
-	if !save_identity(client.storage_path, Saved_Identity{client.saved_device_id, enabled}) {
+	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled}) {
 		log(client, .Warning, "Ravensight: could not save the analytics choice to the storage file.")
 	}
 	core_set_opted_out(&client.core, !enabled)
@@ -392,7 +399,7 @@ reset_device_id :: proc(client: ^Client) -> string {
 	delete(client.device_id)
 	client.saved_device_id = fresh
 	client.device_id = strings.clone(fresh)
-	if !save_identity(client.storage_path, Saved_Identity{fresh, !client.core.opted_out}) {
+	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out}) {
 		log(client, .Warning, "Ravensight: could not save the new device id to the storage file.")
 	}
 	core_discard_queue(&client.core)

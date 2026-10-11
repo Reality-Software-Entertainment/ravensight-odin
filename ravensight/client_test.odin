@@ -389,7 +389,7 @@ test_client_device_id_is_saved_and_reused :: proc(t: ^testing.T) {
 	testing.expect_value(t, load_identity(storage_in(&f), context.temp_allocator).device_id, id)
 
 	// An existing saved id in another format is kept as it is.
-	testing.expect(t, save_identity(storage_in(&f), Saved_Identity{"0123456789abcdef0123456789abcdef-macos", true}))
+	testing.expect(t, save_identity(storage_in(&f), Saved_Identity{device_id = "0123456789abcdef0123456789abcdef-macos", tracking_enabled = true}))
 	d := fake_client(t, &f, Config{})
 	testing.expect_value(t, device_id(d), "0123456789abcdef0123456789abcdef-macos")
 	close_client(d)
@@ -820,4 +820,58 @@ test_nil_client_is_a_no_op :: proc(t: ^testing.T) {
 	testing.expect(t, !is_ready(cl))
 	testing.expect_value(t, queue_len(cl), 0)
 	shutdown(cl)
+}
+
+// --- Fix round 1 -------------------------------------------------------------------
+
+@(test)
+test_client_waiting_feedback_survives_a_failed_session :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	rec: Recorder
+	defer recorder_destroy(&rec)
+	cl := fake_client(t, &f, Config{disable_lifecycle_events = true, callbacks = recorder_callbacks(&rec)})
+	testing.expect(t, submit_feedback(cl, "only feedback is waiting", "other"))
+	tick(cl)
+	answer_next(t, &f, "/settings", 200, `{"trackingEnabled":true}`)
+	tick(cl)
+	answer_next(t, &f, "/session", 500, `{"error":"internal_error"}`)
+	tick(cl)
+	testing.expect_value(t, len(f.requests), 2) // backing off
+	f.now += DEFAULT_RETRY_MS
+	tick(cl)
+	answer_next(t, &f, "/session", 201, `{"token":"tok_2"}`)
+	testing.expect_value(t, count_requests(&f, "/feedback"), 1)
+	answer(&f, len(f.requests) - 1, 201, `{}`)
+	testing.expect_value(t, rec.feedback_ok, 1)
+	close_client(cl)
+}
+
+@(test)
+test_client_unreadable_storage_file_is_kept_and_opts_out :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	rec: Recorder
+	defer recorder_destroy(&rec)
+	testing.expect(t, os.make_directory_all(f.dir) == nil)
+	corrupt := `{"deviceId":"dev_0123","trackingEnabled":fal`
+	testing.expect(t, os.write_entire_file(storage_in(&f), corrupt) == nil)
+
+	cl := fake_client(t, &f, Config{callbacks = recorder_callbacks(&rec)})
+	testing.expect(t, !is_active(cl))
+	testing.expect_value(t, init_reason(cl), Reason.Disabled)
+	testing.expect(t, !track(cl, "e"))
+	for _ in 0 ..< 10 {
+		f.now += 5_000
+		tick(cl)
+	}
+	shutdown(cl)
+	testing.expect_value(t, len(f.requests), 0)
+	testing.expect_value(t, len(rec.logs), 1)
+
+	after, _ := os.read_entire_file(storage_in(&f), context.temp_allocator)
+	testing.expect_value(t, string(after), corrupt)
+	testing.expect(t, load_identity(storage_in(&f), context.temp_allocator).unreadable)
 }

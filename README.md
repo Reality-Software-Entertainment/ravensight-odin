@@ -15,8 +15,8 @@ your main loop.
 
 What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
 
-* `odin test ravensight`: 56 tests pass. 33 drive the protocol state machine
-  in `core.odin` with a fake clock; 23 drive the public API in `client.odin`
+* `odin test ravensight`: 58 tests pass. 33 drive the protocol state machine
+  in `core.odin` with a fake clock; 25 drive the public API in `client.odin`
   through a fake transport and a real storage file in a temporary folder.
 * `odin build examples/minimal` builds.
 * The libcurl transport was run end to end against a local mock server:
@@ -72,8 +72,9 @@ main :: proc() {
         ingest_key = "gt_live_your_key",
     })
     if err != .None {
-        // Missing key or libcurl unavailable. Every rs call accepts a nil
-        // client and does nothing, so the game runs without analytics.
+        // Missing key or libcurl unavailable. Stop here, or carry on:
+        // every rs call accepts a nil client and does nothing.
+        return
     }
 
     for game_running {
@@ -270,6 +271,12 @@ The id and the player's choice live in one small JSON file,
 | Windows | `%APPDATA%` |
 | Linux | `$XDG_DATA_HOME`, or `~/.local/share` |
 
+The folder includes the executable name, so an executable whose name
+changes between versions (for example `mygame-1.2`) starts a new identity
+and a new opt-out; give it a stable name or set `Config.storage_path`. If
+the file exists but cannot be read, the SDK treats the player as opted out
+for that run and leaves the file untouched.
+
 Set `Config.storage_path` to keep it inside your own save folder instead.
 Pass the same path to `write_tracking_enabled` if you call it from another
 program, such as a launcher.
@@ -372,7 +379,7 @@ get the last batch out.
 ## Running the tests
 
 ```bash
-odin test ravensight          # 56 tests, no network, no engine
+odin test ravensight          # 58 tests, no network, no engine
 odin build examples/minimal   # the example compiles and links libcurl
 ```
 

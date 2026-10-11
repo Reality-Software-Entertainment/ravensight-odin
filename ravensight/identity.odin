@@ -68,25 +68,33 @@ sanitize_app_name :: proc(name: string) -> string {
 Saved_Identity :: struct {
 	device_id:        string, // "" when the file has none
 	tracking_enabled: bool,   // true unless the player opted out
+	// The file exists but could not be read or parsed. It may hold an
+	// opt-out, so the caller must treat the player as opted out and must not
+	// overwrite it on its own.
+	unreadable:       bool,
 }
 
-// Reads the storage file. A missing or unreadable file reads as no id and
-// tracking on. `device_id` is allocated with `allocator`.
+// Reads the storage file. A missing file reads as no id and tracking on; an
+// existing file that cannot be read or parsed sets `unreadable`.
+// `device_id` is allocated with `allocator`.
 load_identity :: proc(path: string, allocator := context.allocator) -> (saved: Saved_Identity) {
 	saved.tracking_enabled = true
-	if len(path) == 0 {
+	if len(path) == 0 || !os.exists(path) {
 		return
 	}
 	data, rerr := os.read_entire_file(path, context.temp_allocator)
 	if rerr != nil {
+		saved.unreadable = true
 		return
 	}
 	parsed, perr := json.parse(data, allocator = context.temp_allocator)
 	if perr != nil {
+		saved.unreadable = true
 		return
 	}
 	obj, is_obj := parsed.(json.Object)
 	if !is_obj {
+		saved.unreadable = true
 		return
 	}
 	if v, has := obj["deviceId"]; has {
@@ -146,6 +154,7 @@ write_tracking_enabled :: proc(enabled: bool, storage_path := "") -> bool {
 	if len(path) == 0 {
 		path = default_storage_path(context.temp_allocator)
 	}
+	// An explicit choice: it replaces even a file that could not be read.
 	saved := load_identity(path, context.temp_allocator)
 	saved.tracking_enabled = enabled
 	return save_identity(path, saved)

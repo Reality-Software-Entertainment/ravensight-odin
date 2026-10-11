@@ -47,7 +47,7 @@ may break the API.
 - `FEEDBACK_CATEGORIES` and local feedback validation (`invalid_category`,
   `invalid_rating`); up to 5 feedback messages wait for a session.
 - `device_id(client)`.
-- Client tests through a fake transport (23), alongside the core tests (33).
+- Client tests through a fake transport (25), alongside the core tests (33).
 
 ### Fixed
 
@@ -65,3 +65,7 @@ may break the API.
 - An answer to a request sent before an opt-out, a reset or the kill switch
   no longer removes events queued afterwards.
 - `shutdown()` with nothing queued makes no request.
+- Feedback waiting for a session is still sent when the first session
+  attempt fails and a later one succeeds.
+- A storage file that exists but cannot be read is kept, and the player is
+  treated as opted out for that run, instead of being overwritten.

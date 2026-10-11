@@ -420,7 +420,8 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			sig.reason = res.error_code
 		}
 	case .Session:
-		c.session_wanted = false
+		// session_wanted stays set until a session opens, so feedback that
+		// waits for one survives a failed or stale attempt.
 		if c.in_flight_session_gen != c.session_gen {
 			// The session was dropped (reset_device_id) while this was in
 			// flight. Whatever it says belongs to the old identity.
@@ -443,6 +444,7 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 				c.session_expires_at_ms = now_ms + DEFAULT_SESSION_TTL_MS
 			}
 			c.stats.sessions += 1
+			c.session_wanted = false
 			c.key_refused = false
 			c.last_failure = .None
 			core_reset_backoff(c)
