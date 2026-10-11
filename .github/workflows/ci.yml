@@ -18,7 +18,7 @@ jobs:
       - name: Install Odin
         uses: laytan/setup-odin@v2
         with:
-          release: latest
+          release: dev-2026-08
           token: ${{ github.token }}
 
       - name: Install libcurl (Linux)
