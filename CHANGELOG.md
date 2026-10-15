@@ -3,6 +3,20 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.3.0] - 2026-10-15
+
+### Added
+
+- Typed event helpers `track_purchase`, `track_resource`, `track_progression`
+  and `track_error`. Each sets the reserved `rs_*` properties and calls
+  `track`, takes optional `extra` properties (reserved keys win) and an
+  optional event `name`, and returns what `track` returns.
+- Opt-in health sampling, `Config.performance`. `tick(client, dt)` samples one
+  frame per second (at most 600 samples), and `shutdown` sends a single
+  `health` event with the median and 10th percentile frames per second and the
+  boot time. `tick(client)` without `dt` still works.
+- The session request carries `"sdk": "odin/<version>"`.
+
 ## [0.2.0] - 2026-10-10
 
 ### Breaking
