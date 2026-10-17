@@ -16,7 +16,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-VERSION :: "0.2.0"
+VERSION :: "0.3.0"
 DEFAULT_API_URL :: "https://api.ravensight.io"
 DEFAULT_REQUEST_TIMEOUT_MS :: 15_000
 // shutdown() holds the quit for at most this long by default.
@@ -29,11 +29,27 @@ MAX_PENDING_FEEDBACK :: 5
 FEEDBACK_CATEGORIES :: [6]string{"bug", "suggestion", "complaint", "praise", "playtest", "other"}
 
 INVALID_KEY_WARNING :: "Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key."
+NO_KEY_WARNING :: "Ravensight: no ingest_key, so analytics is off for this run (set Config.optional to silence this line)."
+// The distribution label is at most this many characters, counted in UTF-16
+// units as the server counts them.
+MAX_DISTRIBUTION_LENGTH :: 40
 
 Error :: enum {
 	None,
+	// No longer returned since 0.3.0: an empty key makes an inert client.
 	Missing_Ingest_Key,
 	Curl_Init_Failed,
+}
+
+// When the client may start collecting.
+Consent :: enum {
+	// The default: collecting until the player opts out with
+	// set_tracking_enabled(client, false), which is saved.
+	Opt_Out,
+	// Nothing at all until the player's set_tracking_enabled(client, true):
+	// no device id, no settings check, no session. Events tracked before the
+	// yes are dropped. The yes is saved in the storage file.
+	Opt_In,
 }
 
 Log_Level :: enum {
@@ -51,6 +67,8 @@ Callbacks :: struct {
 	on_session_failed:     proc(user: rawptr, reason: string),
 	on_tracking_disabled:  proc(user: rawptr),
 	on_events_flushed:     proc(user: rawptr, count: int),
+	// Also called with "event_too_large" for an event whose data is over
+	// MAX_EVENT_BYTES as JSON, which is dropped before it is queued.
 	on_flush_failed:       proc(user: rawptr, reason: string),
 	on_feedback_submitted: proc(user: rawptr),
 	on_feedback_failed:    proc(user: rawptr, reason: string),
@@ -68,8 +86,22 @@ Callbacks :: struct {
 // Zero values mean defaults, so `Config{ingest_key = "gt_live_..."}` is a
 // complete configuration.
 Config :: struct {
-	// Publishable ingest key, format gt_live_... Required.
+	// Publishable ingest key, gt_live_... or, for a build anyone can
+	// download, a public gt_pub_... key injected at build time. Empty makes
+	// the client inert: no files, no requests, libcurl never initialized,
+	// every call a quiet no-op, init_reason .No_Key.
 	ingest_key:               string,
+	// True silences the one warning an inert client (no key) logs.
+	optional:                 bool,
+	// .Opt_In sends nothing, and makes no device id, until the player's
+	// set_tracking_enabled(client, true). The zero value .Opt_Out keeps the
+	// 0.2.0 behaviour.
+	consent:                  Consent,
+	// A short label of your own for this build, such as "steam-release" or
+	// "itch-demo", sent on POST /session as distribution. Trimmed; at most
+	// 40 characters, no control characters, otherwise not sent (one
+	// warning). "" sends nothing.
+	distribution:             string,
 	// API host. With or without "/api/v1" and trailing slashes. Default
 	// "https://api.ravensight.io".
 	api_url:                  string,
@@ -158,6 +190,13 @@ Client :: struct {
 	device_id:          string, // owned; the id sent this run
 	saved_device_id:    string, // owned; the id in the storage file, may be ""
 	storage_path:       string, // owned; "" in a playtest run or without storage
+	consent:            Consent,
+	saved_opt_in:       bool, // the yes saved for Consent.Opt_In
+	distribution:       string, // owned; validated, "" when unset or invalid
+	event_nonce:        string, // owned; 8 hex characters, once per client
+	event_counter:      u64,
+	start_unix_s:       i64,
+	warned_too_large:   bool,
 	playtest:           Playtest_Context, // owned strings; token "" outside a playtest
 	request_timeout_ms: i64,
 	lifecycle:          bool,
@@ -188,7 +227,7 @@ create :: proc(config: Config, allocator := context.allocator) -> (client: ^Clie
 @(private)
 create_with_transport :: proc(config: Config, transport: Transport, read_process: bool, allocator := context.allocator) -> (client: ^Client, err: Error) {
 	if len(strings.trim_space(config.ingest_key)) == 0 {
-		return nil, .Missing_Ingest_Key
+		return create_inert(config, transport, allocator), .None
 	}
 	multi: CURLM
 	if transport.send == nil {
@@ -225,6 +264,15 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	}
 	cl.core = core_make(config.max_queue_size, flush_interval, allocator)
 	cl.core.enabled = !config.start_disabled
+	cl.core.random = random_unit
+	cl.consent = config.consent
+	cl.event_nonce = random_hex(4, allocator)
+	cl.start_unix_s = client_now(cl) / 1000
+	label, bad_label := validated_distribution(config.distribution)
+	cl.distribution = strings.clone(label)
+	if bad_label {
+		log(cl, .Warning, "Ravensight: distribution must be at most 40 characters with no control characters; it is not sent.")
+	}
 
 	explicit := Playtest_Context{
 		token   = config.playtest_token,
@@ -263,7 +311,8 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	} else {
 		cl.storage_path = len(config.storage_path) > 0 ? strings.clone(config.storage_path) : default_storage_path()
 		saved := load_identity(cl.storage_path)
-		cl.core.opted_out = !saved.tracking_enabled
+		cl.saved_opt_in = saved.opted_in
+		cl.core.opted_out = !saved_choice(saved, cl.consent)
 		if saved.unreadable {
 			// It may hold an opt-out: honour that for this run, keep the
 			// file, and use an id that is never saved. Only the player's own
@@ -273,9 +322,12 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 			log(cl, .Warning, "Ravensight: the storage file exists but could not be read; tracking is off for this run and the file was left as it is.")
 		} else if len(saved.device_id) > 0 {
 			cl.saved_device_id = saved.device_id
+		} else if cl.consent == .Opt_In && cl.core.opted_out {
+			// No yes yet: no device id is made or saved until there is one.
+			cl.saved_device_id = strings.clone("")
 		} else {
 			cl.saved_device_id = generate_device_id(allocator)
-			if !save_identity(cl.storage_path, Saved_Identity{device_id = cl.saved_device_id, tracking_enabled = saved.tracking_enabled}) {
+			if !save_identity(cl.storage_path, Saved_Identity{device_id = cl.saved_device_id, tracking_enabled = saved.tracking_enabled, opted_in = saved.opted_in}) {
 				log(cl, .Warning, "Ravensight: could not save the device id; players will count as new each launch. Set Config.storage_path to a writable file.")
 			}
 		}
@@ -288,10 +340,114 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	return cl, .None
 }
 
+// A keyless clone or a development build: a client that is never active.
+// No libcurl, no file written, no request; the storage path is kept only so
+// the player's choice can still be saved.
+@(private)
+create_inert :: proc(config: Config, transport: Transport, allocator: runtime.Allocator) -> ^Client {
+	context.allocator = allocator
+	cl := new(Client)
+	cl.allocator = allocator
+	cl.transport = transport
+	cl.cb = config.callbacks
+	cl.api_url = normalize_api_url(config.api_url)
+	cl.ingest_key = strings.clone("")
+	cl.game_version = strings.clone(len(config.game_version) > 0 ? config.game_version : "1.0.0")
+	cl.platform = strings.clone(len(config.platform) > 0 ? config.platform : default_platform())
+	cl.side = make([dynamic]^Transfer)
+	cl.pending_feedback = make([dynamic]Pending_Feedback)
+	cl.core = core_make(config.max_queue_size, DEFAULT_FLUSH_INTERVAL_MS, allocator)
+	cl.core.inert = true
+	cl.consent = config.consent
+	cl.storage_path = len(config.storage_path) > 0 ? strings.clone(config.storage_path) : default_storage_path()
+	saved := load_identity(cl.storage_path)
+	cl.saved_opt_in = saved.opted_in
+	cl.core.opted_out = !saved_choice(saved, cl.consent)
+	cl.saved_device_id = saved.device_id
+	cl.device_id = strings.clone(saved.device_id)
+	cl.distribution = strings.clone("")
+	cl.event_nonce = strings.clone("")
+	cl.last_reason = core_reason(&cl.core)
+	if !config.optional {
+		log(cl, .Warning, NO_KEY_WARNING)
+	}
+	return cl
+}
+
+// The distribution option, trimmed, when it is valid; "" otherwise, with
+// `invalid` set when there was something that could not be sent.
+@(private)
+validated_distribution :: proc(raw: string) -> (label: string, invalid: bool) {
+	label = strings.trim_space(raw)
+	if len(label) == 0 {
+		return "", false
+	}
+	units := 0
+	for i in 0 ..< len(label) {
+		ch := label[i]
+		if ch < 0x20 || ch == 0x7f {
+			return "", true
+		}
+		if ch & 0xC0 != 0x80 {
+			units += ch >= 0xF0 ? 2 : 1
+		}
+	}
+	if units > MAX_DISTRIBUTION_LENGTH {
+		return "", true
+	}
+	return label, false
+}
+
+// The next rs_event_id: the first 16 characters of the device id (anything
+// outside A-Z, a-z, 0-9, _ and - replaced with _), the start time in hex,
+// the per-client nonce and a counter. Allocated in the temp allocator.
+@(private)
+next_event_id :: proc(client: ^Client) -> string {
+	client.event_counter += 1
+	prefix := client.device_id[:min(16, len(client.device_id))]
+	b := strings.builder_make(context.temp_allocator)
+	for i in 0 ..< len(prefix) {
+		ch := prefix[i]
+		switch ch {
+		case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '_', '-':
+			strings.write_byte(&b, ch)
+		case:
+			strings.write_byte(&b, '_')
+		}
+	}
+	fmt.sbprintf(&b, "-%x-%s-%d", client.start_unix_s, client.event_nonce, client.event_counter)
+	return strings.to_string(b)
+}
+
+// Adds rs_event_id to an event's JSON object. Non-object data is left alone.
+@(private)
+with_event_id :: proc(client: ^Client, data_json: string) -> string {
+	body := strings.trim_space(data_json)
+	if len(body) == 0 {
+		body = "{}"
+	}
+	if !strings.has_prefix(body, "{") || !strings.has_suffix(body, "}") {
+		return data_json
+	}
+	inner := strings.trim_space(body[1:len(body) - 1])
+	b := strings.builder_make(context.temp_allocator)
+	strings.write_byte(&b, '{')
+	if len(inner) > 0 {
+		strings.write_string(&b, inner)
+		strings.write_byte(&b, ',')
+	}
+	strings.write_string(&b, `"rs_event_id":`)
+	write_json_string(&b, next_event_id(client))
+	strings.write_byte(&b, '}')
+	return strings.to_string(b)
+}
+
 // Queues an event. `data` is any JSON-serializable value (a struct or a map
 // with string keys); nil sends an empty object. Only enqueues: sending
-// happens from tick(). Returns false when tracking is off or `data` cannot
-// be serialized.
+// happens from tick(). Every event's data gets an rs_event_id, kept in the
+// queue so a resend carries the same id. Returns false when tracking is off,
+// `data` cannot be serialized, or its JSON is over MAX_EVENT_BYTES (dropped,
+// on_flush_failed "event_too_large", one warning for the run).
 track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
 	if client == nil {
 		return false
@@ -312,17 +468,30 @@ track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
 	if len(client.playtest.token) > 0 {
 		data_json = with_playtest_tags(client, data_json)
 	}
+	if len(name) == 0 {
+		return false
+	}
+	data_json = with_event_id(client, data_json)
+	if len(data_json) > MAX_EVENT_BYTES {
+		client.core.stats.dropped += 1
+		if !client.warned_too_large {
+			client.warned_too_large = true
+			log(client, .Warning, fmt.tprintf("Ravensight: dropped event \"%s\": larger than %d bytes as JSON (further drops are not logged).", name, MAX_EVENT_BYTES))
+		}
+		if client.cb.on_flush_failed != nil {
+			client.cb.on_flush_failed(client.cb.user, "event_too_large")
+		}
+		return false
+	}
 	return core_track(&client.core, name, data_json, client_now(client))
 }
 
 // Asks for queued events to be sent on the next tick(), without waiting for
 // the flush timer. With force = true any active backoff wait is skipped too.
-// After the ingest key was refused, this allows exactly one more attempt.
 flush :: proc(client: ^Client, force := false) {
 	if client == nil {
 		return
 	}
-	core_allow_one_attempt(&client.core)
 	if force {
 		core_force_flush(&client.core)
 	} else {
@@ -351,6 +520,11 @@ set_enabled :: proc(client: ^Client, enabled: bool) {
 // read again on every launch. A saved opt-out wins over Config. Turning it
 // off discards the queue and stops sending. Works on a client created with
 // start_disabled too. Before a client exists use write_tracking_enabled.
+// With Consent.Opt_In, true is the yes that starts everything (the first
+// moment a device id exists) and events tracked right after it are queued
+// while the settings check runs; false again keeps the device id
+// (reset_device_id forgets it). The choice is saved on an inert client and
+// after a refused key too, but nothing restarts this run.
 // Ignored (one log line) during a playtest run.
 set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 	if client == nil {
@@ -361,7 +535,17 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 		log(client, .Info, "Ravensight: set_tracking_enabled is ignored during a playtest run.")
 		return
 	}
-	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled}) {
+	if enabled && !client.core.inert && !client.core.stopped && len(client.saved_device_id) == 0 {
+		// Consent.Opt_In: the yes is the first moment an id may exist.
+		delete(client.saved_device_id)
+		delete(client.device_id)
+		client.saved_device_id = generate_device_id(client.allocator)
+		client.device_id = strings.clone(client.saved_device_id)
+	}
+	if client.consent == .Opt_In || !enabled {
+		client.saved_opt_in = enabled
+	}
+	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled, opted_in = client.saved_opt_in}) {
 		log(client, .Warning, "Ravensight: could not save the analytics choice to the storage file.")
 	}
 	core_set_opted_out(&client.core, !enabled)
@@ -394,12 +578,31 @@ reset_device_id :: proc(client: ^Client) -> string {
 		log(client, .Info, "Ravensight: reset_device_id is ignored during a playtest run.")
 		return client.device_id
 	}
+	if client.core.inert {
+		return client.device_id
+	}
+	if client.consent == .Opt_In && client.core.opted_out {
+		// Not opted in: forget any saved id and make none until the yes.
+		if len(client.storage_path) > 0 && os.exists(client.storage_path) {
+			os.remove(client.storage_path)
+		}
+		delete(client.saved_device_id)
+		delete(client.device_id)
+		client.saved_device_id = strings.clone("")
+		client.device_id = strings.clone("")
+		client.saved_opt_in = false
+		core_discard_queue(&client.core)
+		core_invalidate_session(&client.core)
+		drop_pending_feedback(client, "device_id_reset")
+		sync_reason(client)
+		return client.device_id
+	}
 	fresh := generate_device_id(client.allocator)
 	delete(client.saved_device_id)
 	delete(client.device_id)
 	client.saved_device_id = fresh
 	client.device_id = strings.clone(fresh)
-	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out}) {
+	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out, opted_in = client.saved_opt_in}) {
 		log(client, .Warning, "Ravensight: could not save the new device id to the storage file.")
 	}
 	core_discard_queue(&client.core)
@@ -426,13 +629,19 @@ is_ready :: proc(client: ^Client) -> bool {
 	return core_is_session_valid(&client.core, client_now(client))
 }
 
-// True when events are being queued and sent: enabled, not opted out, the
-// server kill switch on, and not stopped.
+// True when events are being queued and sent: a key, enabled, not opted out
+// (or opted in), the server kill switch on, and not stopped.
 is_active :: proc(client: ^Client) -> bool {
 	if client == nil {
 		return false
 	}
 	return core_is_active(&client.core)
+}
+
+// True only while the client is collecting; the same answer as is_active.
+// Use it to skip work that only feeds analytics.
+is_enabled :: proc(client: ^Client) -> bool {
+	return is_active(client)
 }
 
 // True when a Ravensight Playtest token was found at create().
@@ -497,7 +706,7 @@ submit_feedback :: proc(client: ^Client, message: string, category := "", rating
 	}
 	context.allocator = client.allocator
 	if !core_is_active(&client.core) {
-		fail_feedback(client, "disabled")
+		fail_feedback(client, client.core.inert ? "no_key" : "disabled")
 		return false
 	}
 	if len(strings.trim_space(message)) == 0 {
@@ -639,6 +848,8 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	delete(client.device_id)
 	delete(client.saved_device_id)
 	delete(client.storage_path)
+	delete(client.distribution)
+	delete(client.event_nonce)
 	delete(client.playtest.token)
 	delete(client.playtest.run_id)
 	delete(client.playtest.job_id)
@@ -919,6 +1130,10 @@ start_next_protocol_request :: proc(client: ^Client) {
 		write_json_string(&b, client.game_version)
 		strings.write_string(&b, `,"platform":`)
 		write_json_string(&b, client.platform)
+		if len(client.distribution) > 0 {
+			strings.write_string(&b, `,"distribution":`)
+			write_json_string(&b, client.distribution)
+		}
 		strings.write_byte(&b, '}')
 		t = start_request(client, "/session", strings.to_string(b), .API_Key)
 	case .Batch:

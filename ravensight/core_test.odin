@@ -494,26 +494,19 @@ test_settings_401_refuses_key_then_silence :: proc(t: ^testing.T) {
 	testing.expect(t, !sig.settings_failed)
 	testing.expect_value(t, core_reason(&c), Reason.Invalid_Key)
 
-	// One request, then none, however long we wait; the queue is kept.
+	// The run ends: the queue is cleared, and nothing more is sent however
+	// long we wait, not even on an explicit flush.
 	expect_no_request(t, &c, T0+1)
 	expect_no_request(t, &c, T0+10_000_000)
-	testing.expect_value(t, len(c.queue), 3)
-	testing.expect(t, core_track(&c, "still_queues", "", T0))
-
-	// An explicit flush allows exactly one more attempt.
-	core_allow_one_attempt(&c)
-	core_request_flush(&c)
-	req2, ok2 := core_next(&c, T0+2)
-	testing.expect(t, ok2)
-	testing.expect_value(t, req2.kind, Request_Kind.Session)
-	sig2 := core_on_response(&c, Core_Response{status = 401}, T0+2)
-	testing.expect(t, sig2.session_failed)
-	testing.expect(t, !sig2.key_refused) // already refused, not reported twice
+	testing.expect_value(t, len(c.queue), 0)
+	testing.expect(t, !core_track(&c, "dropped", "", T0))
+	testing.expect(t, !core_is_active(&c))
+	core_force_flush(&c)
 	expect_no_request(t, &c, T0+10_000_000)
 }
 
 @(test)
-test_key_refused_clears_when_a_session_opens :: proc(t: ^testing.T) {
+test_session_403_refused_key_ends_the_run :: proc(t: ^testing.T) {
 	c := core_make()
 	defer core_destroy(&c)
 	boot(t, &c, T0, with_session = false)
@@ -525,11 +518,30 @@ test_key_refused_clears_when_a_session_opens :: proc(t: ^testing.T) {
 	testing.expect(t, sig.key_refused)
 	testing.expect_value(t, sig.reason, "invalid_key")
 	testing.expect_value(t, core_reason(&c), Reason.Invalid_Key)
+	testing.expect_value(t, len(c.queue), 0)
+	core_force_flush(&c)
+	expect_no_request(t, &c, T0+10_000_000)
 
-	core_allow_one_attempt(&c)
-	open_session(t, &c, T0+1)
-	testing.expect(t, !c.key_refused)
-	testing.expect_value(t, core_reason(&c), Reason.None)
+	// A session 401 ends it too, and a batch 403.
+	c2 := core_make()
+	defer core_destroy(&c2)
+	boot(t, &c2, T0, with_session = false)
+	track_n(&c2, 1, T0)
+	core_next(&c2, T0)
+	sig2 := core_on_response(&c2, Core_Response{status = 401, error_code = "invalid_api_key"}, T0)
+	testing.expect(t, sig2.key_refused)
+	testing.expect_value(t, core_reason(&c2), Reason.Invalid_Key)
+	expect_no_request(t, &c2, T0+10_000_000)
+
+	c3 := core_make()
+	defer core_destroy(&c3)
+	boot(t, &c3, T0)
+	track_n(&c3, 2, T0)
+	core_request_flush(&c3)
+	sig3 := step_batch(t, &c3, T0, 3, Core_Response{status = 403, error_code = "forbidden"})
+	testing.expect(t, sig3.key_refused)
+	testing.expect_value(t, len(c3.queue), 0)
+	expect_no_request(t, &c3, T0+10_000_000)
 }
 
 @(test)
@@ -579,7 +591,6 @@ test_batch_403_playtest_job_closed_stops :: proc(t: ^testing.T) {
 	testing.expect(t, !core_track(&c, "later", "", T0))
 
 	// Permanent: even an explicit flush sends nothing.
-	core_allow_one_attempt(&c)
 	core_force_flush(&c)
 	expect_no_request(t, &c, T0+10_000_000)
 }

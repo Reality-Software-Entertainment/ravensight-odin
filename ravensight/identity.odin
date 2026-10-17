@@ -4,6 +4,8 @@
 //
 //   {"deviceId":"dev_<32 hex>","trackingEnabled":true}
 //
+// With Consent.Opt_In the player's yes adds "optIn":true.
+//
 // By default it lives at <user data dir>/ravensight/<executable name>/ravensight.json
 // (macOS: ~/Library/Application Support, Windows: %APPDATA%, Linux:
 // $XDG_DATA_HOME or ~/.local/share). Config.storage_path overrides it. A
@@ -68,6 +70,7 @@ sanitize_app_name :: proc(name: string) -> string {
 Saved_Identity :: struct {
 	device_id:        string, // "" when the file has none
 	tracking_enabled: bool,   // true unless the player opted out
+	opted_in:         bool,   // the player's yes for Consent.Opt_In
 	// The file exists but could not be read or parsed. It may hold an
 	// opt-out, so the caller must treat the player as opted out and must not
 	// overwrite it on its own.
@@ -107,7 +110,21 @@ load_identity :: proc(path: string, allocator := context.allocator) -> (saved: S
 			saved.tracking_enabled = bool(b)
 		}
 	}
+	if v, has := obj["optIn"]; has {
+		if b, is_bool := v.(json.Boolean); is_bool {
+			saved.opted_in = bool(b)
+		}
+	}
 	return
+}
+
+// The player's saved choice for a consent mode: true when tracking may run.
+// Opt_Out: on unless an opt-out was saved. Opt_In: off unless a yes was saved.
+saved_choice :: proc(saved: Saved_Identity, consent: Consent) -> bool {
+	if consent == .Opt_In {
+		return saved.opted_in && saved.tracking_enabled
+	}
+	return saved.tracking_enabled
 }
 
 // Writes the storage file synchronously, creating its folder. The write
@@ -132,6 +149,9 @@ save_identity :: proc(path: string, saved: Saved_Identity) -> bool {
 	}
 	strings.write_string(&b, `"trackingEnabled":`)
 	strings.write_string(&b, saved.tracking_enabled ? "true" : "false")
+	if saved.opted_in {
+		strings.write_string(&b, `,"optIn":true`)
+	}
 	strings.write_byte(&b, '}')
 
 	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
@@ -147,9 +167,10 @@ save_identity :: proc(path: string, saved: Saved_Identity) -> bool {
 
 // Saves the player's analytics choice without a client, e.g. from a
 // settings screen before create() or in a launcher. The saved device id is
-// kept. `storage_path` "" means default_storage_path(). Returns false when
-// the file could not be written.
-write_tracking_enabled :: proc(enabled: bool, storage_path := "") -> bool {
+// kept. `storage_path` "" means default_storage_path(). Pass the consent
+// mode the client will use: with .Opt_In, true is the player's yes. Returns
+// false when the file could not be written.
+write_tracking_enabled :: proc(enabled: bool, storage_path := "", consent := Consent.Opt_Out) -> bool {
 	path := storage_path
 	if len(path) == 0 {
 		path = default_storage_path(context.temp_allocator)
@@ -157,6 +178,9 @@ write_tracking_enabled :: proc(enabled: bool, storage_path := "") -> bool {
 	// An explicit choice: it replaces even a file that could not be read.
 	saved := load_identity(path, context.temp_allocator)
 	saved.tracking_enabled = enabled
+	if consent == .Opt_In || !enabled {
+		saved.opted_in = enabled
+	}
 	return save_identity(path, saved)
 }
 
@@ -171,6 +195,31 @@ generate_device_id :: proc(allocator: runtime.Allocator) -> string {
 		fmt.sbprintf(&b, "%02x", x)
 	}
 	return strings.to_string(b)
+}
+
+// `bytes` random bytes from the platform's cryptographic random source, as
+// lowercase hex.
+random_hex :: proc(bytes: int, allocator: runtime.Allocator) -> string {
+	buf := make([]u8, bytes, context.temp_allocator)
+	crypto.rand_bytes(buf)
+	b := strings.builder_make(allocator)
+	for x in buf {
+		fmt.sbprintf(&b, "%02x", x)
+	}
+	return strings.to_string(b)
+}
+
+// A draw in [0, 1) from the platform's cryptographic random source, for the
+// backoff jitter.
+random_unit :: proc() -> f64 {
+	buf: [8]u8
+	crypto.rand_bytes(buf[:])
+	v: u64
+	for x in buf {
+		v = (v << 8) | u64(x)
+	}
+	// The top 53 bits, so the result is exactly representable and below 1.
+	return f64(v >> 11) / 9007199254740992.0
 }
 
 // A Ravensight Playtest run's identity. Strings are borrowed from wherever

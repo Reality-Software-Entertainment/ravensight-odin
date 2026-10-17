@@ -40,6 +40,7 @@ Recorder :: struct {
 	reasons:           [dynamic]Reason,
 	tracking_disabled: int,
 	sessions_ready:    int,
+	flush_failed:      [dynamic]string,
 }
 
 fake_send :: proc(user: rawptr, t: ^Transfer, req: Http_Request) -> bool {
@@ -145,6 +146,10 @@ recorder_callbacks :: proc(r: ^Recorder) -> Callbacks {
 		on_session_ready = proc(user: rawptr) {
 			(^Recorder)(user).sessions_ready += 1
 		},
+		on_flush_failed = proc(user: rawptr, reason: string) {
+			r := (^Recorder)(user)
+			append(&r.flush_failed, strings.clone(reason))
+		},
 	}
 }
 
@@ -152,6 +157,8 @@ recorder_destroy :: proc(r: ^Recorder) {
 	for s in r.logs {delete(s)}
 	for s in r.feedback_failed {delete(s)}
 	for s in r.suggestions {delete(s)}
+	for s in r.flush_failed {delete(s)}
+	delete(r.flush_failed)
 	delete(r.logs)
 	delete(r.feedback_failed)
 	delete(r.suggestions)
@@ -194,6 +201,9 @@ fake_client :: proc(t: ^testing.T, f: ^Fake, cfg: Config) -> ^Client {
 	transport := Transport{user = f, send = fake_send, now = fake_now, idle = fake_idle}
 	cl, err := create_with_transport(cfg, transport, false)
 	testing.expect_value(t, err, Error.None)
+	// A fixed draw of 0.5 is a jitter factor of exactly 1, so the backoff
+	// waits are the unspread 10, 20, 40 seconds. Jitter tests replace it.
+	cl.core.random = proc() -> f64 {return 0.5}
 	f.client = cl
 	return cl
 }
@@ -515,7 +525,9 @@ test_client_settings_401_one_request_then_none :: proc(t: ^testing.T) {
 	testing.expect_value(t, init_reason(cl), Reason.Invalid_Key)
 	testing.expect_value(t, len(rec.reasons), 1)
 	testing.expect_value(t, rec.reasons[0], Reason.Invalid_Key)
-	testing.expect(t, queue_len(cl) > 0) // queue kept
+	testing.expect_value(t, queue_len(cl), 0) // the run ended: queue cleared
+	testing.expect(t, !track(cl, "later"))
+	testing.expect(t, !is_enabled(cl))
 
 	warnings := 0
 	for l in rec.logs {
@@ -526,17 +538,16 @@ test_client_settings_401_one_request_then_none :: proc(t: ^testing.T) {
 	}
 	testing.expect_value(t, warnings, 1)
 
-	// flush() makes exactly one more attempt.
-	flush(cl)
+	// flush() makes no further attempt, nor does a yes.
+	flush(cl, force = true)
 	tick(cl)
-	testing.expect_value(t, len(f.requests), 2)
-	answer_next(t, &f, "/session", 401, `{"error":"invalid_api_key"}`)
-	tick(cl)
+	set_tracking_enabled(cl, false)
+	set_tracking_enabled(cl, true)
 	f.now += 1_000_000
 	tick(cl)
-	testing.expect_value(t, len(f.requests), 2)
+	testing.expect_value(t, len(f.requests), 1)
 	shutdown(cl) // no quit flush against a refused key
-	testing.expect_value(t, len(f.requests), 2)
+	testing.expect_value(t, len(f.requests), 1)
 }
 
 @(test)
@@ -709,7 +720,7 @@ test_client_playtest_identity_header_and_no_storage :: proc(t: ^testing.T) {
 	testing.expect(t, strings.contains(f.requests[1].body, `"deviceId":"pt-run42"`))
 	batch := f.requests[2].body
 	testing.expect_value(t, f.requests[2].path, "/track/batch")
-	testing.expect(t, strings.contains(batch, `{"level":1,"synthetic":true,"pt_source":"sdk","pt_run":"run42","pt_job":"job7","persona":"speedrunner"}`), batch)
+	testing.expect(t, strings.contains(batch, `{"level":1,"synthetic":true,"pt_source":"sdk","pt_run":"run42","pt_job":"job7","persona":"speedrunner","rs_event_id":"pt-run42-`), batch)
 
 	// The run's job closes: permanent stop, queue cleared, logged once.
 	answer(&f, 2, 403, `{"error":"playtest_job_closed"}`)

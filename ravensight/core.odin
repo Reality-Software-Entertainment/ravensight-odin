@@ -33,18 +33,25 @@ EXPIRY_SKEW_MS :: 5_000
 // Consecutive 401-driven re-auths tolerated before backing off, so a server
 // that rejects every fresh token cannot cause a hot request loop.
 MAX_REAUTH_STREAK :: 2
+// Backoff waits are spread by plus or minus this fraction, so many games
+// that failed together do not retry together. Retry-After is never spread.
+BACKOFF_JITTER :: 0.2
+// The largest event the API accepts: its data serialized as JSON. Bigger
+// events are dropped before they are queued.
+MAX_EVENT_BYTES :: 8192
 
 // Why the client is not sending, in the vocabulary every Ravensight SDK
 // shares. .None means nothing is wrong (ready, or not yet asked).
 Reason :: enum {
 	None,
-	Disabled,            // constructed disabled, set_enabled(false) or the player's opt-out
-	Invalid_Key,         // 401, or a 403 that is not one of the codes below
+	Disabled,            // constructed disabled, set_enabled(false), the player's opt-out, or Opt_In with no yes yet
+	Invalid_Key,         // 401, or a 403 that is not one of the codes below; ends the run
 	Tracking_Disabled,   // server kill switch, from /settings or a 403 tracking_disabled
 	Offline,             // no answer, a timeout, or a 5xx on a batch
 	Rate_Limited,        // 429
 	Session_Failed,      // POST /session failed, or the playtest token is unusable
 	Playtest_Job_Closed, // 403 playtest_job_closed
+	No_Key,              // created with no ingest key: inert
 }
 
 // The wire form of a Reason, e.g. "invalid_key". "" for .None.
@@ -66,6 +73,8 @@ reason_string :: proc(r: Reason) -> string {
 		return "session_failed"
 	case .Playtest_Job_Closed:
 		return "playtest_job_closed"
+	case .No_Key:
+		return "no_key"
 	}
 	return ""
 }
@@ -118,8 +127,8 @@ Signals :: struct {
 	events_flushed:    int, // > 0 when a batch was accepted
 	flush_failed:      bool,
 	event_dropped:     bool, // a single event was rejected with 400 and dropped
-	key_refused:       bool, // the ingest key was refused; automatic sending stopped
-	stopped:           bool, // permanent stop for the run (playtest token refused or closed)
+	key_refused:       bool, // the ingest key was refused; the run ended
+	stopped:           bool, // permanent stop for the run (refused key, playtest token refused or closed)
 	settings_failed:   bool, // GET /settings had no usable answer; tracking assumed on
 	reason:            string,
 }
@@ -142,9 +151,13 @@ Core :: struct {
 	tracking_enabled:      bool, // server kill switch, assumed on until checked
 	stopped:               bool, // permanent for the run
 	stop_reason:           Reason,
-	key_refused:           bool, // automatic requests stop; flush() allows one attempt
-	one_attempt:           bool,
+	key_refused:           bool, // the key was refused; stopped is set too
+	inert:                 bool, // created with no ingest key; never active
 	last_failure:          Reason,
+	// Draws in [0, 1) for the backoff jitter. nil (a bare core) means no
+	// spread, so the state machine stays deterministic; the client sets the
+	// platform's cryptographic random source.
+	random:                proc() -> f64,
 
 	session_token:         string, // owned
 	session_expires_at_ms: i64,
@@ -192,14 +205,17 @@ core_destroy :: proc(c: ^Core) {
 	}
 }
 
-// active = enabled && !opted_out && server tracking on && not stopped.
-// While not active nothing touches the network.
+// active = has a key && enabled && !opted_out && server tracking on && not
+// stopped. While not active nothing touches the network.
 core_is_active :: proc(c: ^Core) -> bool {
-	return c.enabled && !c.opted_out && c.tracking_enabled && !c.stopped
+	return !c.inert && c.enabled && !c.opted_out && c.tracking_enabled && !c.stopped
 }
 
 // The current reason in the shared vocabulary, most permanent cause first.
 core_reason :: proc(c: ^Core) -> Reason {
+	if c.inert {
+		return .No_Key
+	}
 	if !c.enabled || c.opted_out {
 		return .Disabled
 	}
@@ -208,9 +224,6 @@ core_reason :: proc(c: ^Core) -> Reason {
 	}
 	if !c.tracking_enabled {
 		return .Tracking_Disabled
-	}
-	if c.key_refused {
-		return .Invalid_Key
 	}
 	return c.last_failure
 }
@@ -244,7 +257,8 @@ core_set_opted_out :: proc(c: ^Core, opted_out: bool) {
 }
 
 // Stops the client for the rest of the run: queue cleared, no request ever
-// again. Used for a playtest token the server refused or a closed run.
+// again. Used for a refused key, a playtest token the server refused or a
+// closed run.
 core_stop :: proc(c: ^Core, reason: Reason) {
 	if c.stopped {
 		return
@@ -270,13 +284,6 @@ core_invalidate_session :: proc(c: ^Core) {
 	c.session_expires_at_ms = 0
 	c.session_gen += 1
 	c.reauth_streak = 0
-}
-
-// After the key was refused, flush() lets exactly one more request out.
-core_allow_one_attempt :: proc(c: ^Core) {
-	if c.key_refused {
-		c.one_attempt = true
-	}
 }
 
 // Drops everything queued, counting it as dropped.
@@ -340,15 +347,10 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 	if c.in_flight != .None || !core_is_active(c) {
 		return
 	}
-	// A refused key stops automatic requests; flush() allows one attempt.
-	if c.key_refused && !c.one_attempt {
-		return
-	}
 
 	// Boot: read the server kill switch exactly once, before anything else.
 	if !c.settings_checked {
 		c.in_flight = .Settings
-		c.one_attempt = false
 		return Core_Request{kind = .Settings}, true
 	}
 
@@ -365,20 +367,16 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 		if len(c.queue) > 0 || c.session_wanted {
 			c.in_flight = .Session
 			c.in_flight_session_gen = c.session_gen
-			c.one_attempt = false
 			return Core_Request{kind = .Session}, true
 		}
-		c.one_attempt = false
 		return
 	}
 
 	want_flush := len(c.queue) > 0 &&
 		(c.flush_requested ||
-				c.one_attempt ||
 			len(c.queue) >= MAX_BATCH_SIZE ||
 			(c.flush_interval_ms >= 0 && c.next_flush_at_ms > 0 && now_ms >= c.next_flush_at_ms))
 	if !want_flush {
-		c.one_attempt = false
 		return
 	}
 
@@ -387,7 +385,6 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 	c.in_flight = .Batch
 	c.in_flight_batch = n
 	c.in_flight_queue_gen = c.queue_gen
-	c.one_attempt = false
 	return Core_Request{kind = .Batch, body = body, batch_len = n}, true
 }
 
@@ -445,7 +442,6 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			}
 			c.stats.sessions += 1
 			c.session_wanted = false
-			c.key_refused = false
 			c.last_failure = .None
 			core_reset_backoff(c)
 			sig.session_ready = true
@@ -567,8 +563,8 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 //   403 tracking_disabled       kill switch for the run, queue cleared
 //   403 invalid_playtest_token  stop for the run, reason session_failed
 //   403 playtest_job_closed     stop for the run, reason playtest_job_closed
-//   any other 401 or 403        the key was refused: automatic requests stop,
-//                               the queue is kept, flush() tries once more
+//   any other 401 or 403        the key was refused: the run ends, queue
+//                               cleared, nothing more is sent or retried
 core_apply_refusal :: proc(c: ^Core, status: int, error_code: string, sig: ^Signals) {
 	if status == 403 {
 		switch error_code {
@@ -595,8 +591,8 @@ core_apply_refusal :: proc(c: ^Core, status: int, error_code: string, sig: ^Sign
 	if !c.key_refused {
 		c.key_refused = true
 		sig.key_refused = true
+		core_stop(c, .Invalid_Key)
 	}
-	c.one_attempt = false
 }
 
 // --- Backoff -----------------------------------------------------------------
@@ -606,8 +602,17 @@ core_reset_backoff :: proc(c: ^Core) {
 	c.next_attempt_at_ms = 0
 }
 
+// Opens a retry window of the current backoff, spread by plus or minus
+// BACKOFF_JITTER when a random source is set (never past the ceiling), then
+// doubles the backoff up to the ceiling.
 core_schedule_backoff :: proc(c: ^Core, now_ms: i64) {
-	c.next_attempt_at_ms = now_ms + c.backoff_ms
+	wait := c.backoff_ms
+	if c.random != nil {
+		draw := clamp(c.random(), 0, 1)
+		factor := 1 - BACKOFF_JITTER + 2 * BACKOFF_JITTER * draw
+		wait = min(i64(f64(c.backoff_ms) * factor), MAX_BACKOFF_MS)
+	}
+	c.next_attempt_at_ms = now_ms + wait
 	c.backoff_ms = min(c.backoff_ms * 2, MAX_BACKOFF_MS)
 }
 
