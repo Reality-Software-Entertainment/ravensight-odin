@@ -130,6 +130,48 @@ rs.track(analytics, "boss_phase_begin", Boss_Phase{level = "castle", rs_kind = "
 rs.track(analytics, "run_over", Boss_Phase{level = "castle", rs_kind = "death"})
 ```
 
+## Typed events
+
+Four helpers send the reserved `rs_*` properties for you, through the same
+`track` call, so queueing, batching, retries, opt-out and the playtest path are
+unchanged and each returns what `track` returns. They never refuse bad input:
+a wrong amount or a missing field is sent as given and the server flags the
+event, which shows on the Implementation health card.
+
+```odin
+// Money is whole minor units (499 is 4.99), an integer or a digit string.
+// The currency is upper-cased. Event name: "purchase".
+rs.track_purchase(analytics, 499, "usd", "bundle", "starter", cart = "c1", transaction_id = "tx9")
+
+// FLOW_SOURCE or FLOW_SINK. Event name: "resource_source" or "resource_sink".
+rs.track_resource(analytics, rs.FLOW_SOURCE, "gold", 25, item_type = "chest", item_id = "c7")
+rs.track_resource(analytics, rs.FLOW_SINK, "gold", 10)
+
+// STATUS_START, STATUS_COMPLETE or STATUS_FAIL on p1 (and optionally p2, p3),
+// with an optional score. Event name: "progression_start", "progression_complete"
+// or "progression_fail".
+rs.track_progression(analytics, rs.STATUS_COMPLETE, "world1", "level3", score = 1200)
+
+// SEVERITY_DEBUG, _INFO, _WARNING, _ERROR or _CRITICAL. The message is cut to
+// 200 characters and the stack to 2000. Event name: "error".
+rs.track_error(analytics, rs.SEVERITY_ERROR, "save failed", stack = trace)
+```
+
+Every helper takes an optional `extra` map (`rs.Extra`, a `map[string]json.Value`)
+that is merged first, so the reserved keys win over yours, and an optional
+`name` that replaces the default event name.
+
+### Health
+
+Set `Config.performance = true` to opt in. `tick(client, dt)` then samples one
+frame per second (`dt` is the last frame's seconds; leave it out and the SDK
+measures the time between ticks), keeps at most 600 samples, and
+`shutdown()` sends a single `health` event with the median and 10th
+percentile frames per second and the boot time in milliseconds from process
+start to `create()`. Nothing is sent from `tick`, and nothing at all if no
+sample was taken. Memory is not reported, because Odin has no portable way to
+read it. The session request also carries `"sdk": "odin/<version>"`.
+
 ## Feedback
 
 ```odin
@@ -151,9 +193,13 @@ client and does nothing.
 | Call | What it does |
 | --- | --- |
 | `create(config) -> (^Client, Error)` | Creates a client. `Config{ingest_key = "..."}` is a complete configuration. Reads the saved device id and opt-out, and queues `game_started`. With an empty key it returns an inert client and `.None` (see "Public builds"). |
-| `tick(client)` | Pumps the SDK. Call once per frame; never blocks. |
+| `tick(client, dt)` | Pumps the SDK. Optional `dt` in seconds feeds performance sampling. |
 | `track(client, name, data)` | Queues an event. `data` is optional. Returns false when tracking is off, or when the data is over 8,192 bytes as JSON (dropped, `on_flush_failed("event_too_large")`). |
 | `flush(client, force)` | Sends queued events on the next tick instead of waiting for the timer. `force` also skips an active backoff wait. |
+| `track_purchase(client, amount, currency, item_type, item_id, cart, transaction_id, extra, name)` | Typed purchase event. See "Typed events". |
+| `track_resource(client, flow, resource, amount, item_type, item_id, extra, name)` | Typed resource source or sink event. |
+| `track_progression(client, status, p1, p2, p3, score, extra, name)` | Typed progression start, complete or fail event. |
+| `track_error(client, severity, message, stack, extra, name)` | Typed error event; message and stack are cut to length. |
 | `submit_feedback(client, message, category, rating)` | Posts player feedback. Result arrives via callbacks. |
 | `fetch_suggestions(client)` | EXPERIMENTAL. AI generated design suggestions for your game, via `on_suggestions`. While not active it makes no request and answers `"[]"`. |
 | `set_tracking_enabled(client, bool)` | The player's choice, saved and read again on every launch. |
@@ -167,7 +213,7 @@ client and does nothing.
 | `is_ready(client)`, `is_active(client)` | A session exists; tracking is on. |
 | `is_enabled(client)` | The same answer as `is_active`: true only while collecting. |
 | `queue_len(client)`, `stats(client)` | Queue depth and lifetime counters (`sent`, `dropped`, `flushes`, `sessions`). |
-| `shutdown(client, flush_timeout_ms)` | Queues `game_exited`, one best-effort flush, then frees everything. |
+| `shutdown(client, flush_timeout_ms)` | Queues the health summary (when opted in and sampled) and `game_exited`, one best-effort flush, then frees everything. |
 
 Results are delivered through optional callbacks in `Config.callbacks`
 (`on_session_ready`, `on_events_flushed`, `on_feedback_submitted`,
@@ -194,6 +240,7 @@ starts with `Ravensight: `; without a handler, warnings go to stderr.
 | `flush_interval_ms` | `5000` | Queued events are flushed at least this often. Negative flushes only on demand. |
 | `request_timeout_ms` | `15000` | Per request timeout. |
 | `disable_lifecycle_events` | `false` | Set true to suppress the automatic `game_started` and `game_exited` events. |
+| `performance` | `false` | Opt in to once-a-second frame sampling and the single `health` event sent from `shutdown`. See "Typed events". |
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | `""` | Ravensight Playtest. Normally left empty; see "Playtest". |
 
 ## Automatic events
@@ -448,7 +495,7 @@ get the last batch out.
 ## Running the tests
 
 ```bash
-odin test ravensight          # 68 tests, no network, no engine
+odin test ravensight          # local protocol and typed-event tests
 odin build examples/minimal   # the example compiles and links libcurl
 ```
 

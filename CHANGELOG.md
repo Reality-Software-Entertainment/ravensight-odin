@@ -51,6 +51,20 @@ changes listed under Breaking. `VERSION` is `"0.3.0"`.
 - `is_enabled(client)`, `BACKOFF_JITTER`, `MAX_EVENT_BYTES`,
   `MAX_DISTRIBUTION_LENGTH`, `random_hex` and `random_unit`.
 
+### Typed events and performance sampling (included in this release)
+
+### Added
+
+- Typed event helpers `track_purchase`, `track_resource`, `track_progression`
+  and `track_error`. Each sets the reserved `rs_*` properties and calls
+  `track`, takes optional `extra` properties (reserved keys win) and an
+  optional event `name`, and returns what `track` returns.
+- Opt-in health sampling, `Config.performance`. `tick(client, dt)` samples one
+  frame per second (at most 600 samples), and `shutdown` sends a single
+  `health` event with the median and 10th percentile frames per second and the
+  boot time. `tick(client)` without `dt` still works.
+- The session request carries `"sdk": "odin/<version>"`.
+
 ## [0.2.0] - 2026-10-10
 
 ### Breaking

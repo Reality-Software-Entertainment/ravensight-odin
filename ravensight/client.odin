@@ -133,6 +133,9 @@ Config :: struct {
 	playtest_run_id:          string,
 	playtest_job_id:          string,
 	playtest_persona:         string,
+	// Opt in to the once-a-second frame sampling behind the single `health`
+	// event sent from shutdown(). Default false.
+	performance:              bool,
 	callbacks:                Callbacks,
 }
 
@@ -212,6 +215,13 @@ Client :: struct {
 	multi:              CURLM,
 	protocol:           ^Transfer, // the single in-flight protocol request
 	side:               [dynamic]^Transfer,
+	performance:        bool,
+	health_samples:     [dynamic]f64, // frames per second, at most MAX_HEALTH_SAMPLES
+	health_seen:        int,
+	health_last_sample_ms: i64,
+	health_last_tick_ms:   i64,
+	health_sent:        bool,
+	boot_ms:            i64, // process start to create(), ms
 }
 
 @(private)
@@ -252,6 +262,9 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	cl.api_url = normalize_api_url(config.api_url)
 	cl.ingest_key = strings.clone(strings.trim_space(config.ingest_key))
 	cl.game_version = strings.clone(len(config.game_version) > 0 ? config.game_version : "1.0.0")
+	cl.performance = config.performance
+	cl.boot_ms = boot_ms_now()
+	cl.health_last_sample_ms = client_now(cl)
 	cl.platform = strings.clone(len(config.platform) > 0 ? config.platform : default_platform())
 	cl.request_timeout_ms = config.request_timeout_ms > 0 ? config.request_timeout_ms : DEFAULT_REQUEST_TIMEOUT_MS
 	cl.lifecycle = !config.disable_lifecycle_events
@@ -781,11 +794,23 @@ fetch_suggestions :: proc(client: ^Client) -> bool {
 // Pumps the SDK: progresses in-flight requests, dispatches callbacks and
 // starts the next protocol request when one is due. Call once per frame;
 // each call does a small, bounded amount of work and never blocks.
-tick :: proc(client: ^Client) {
+//
+// `dt` is the last frame's duration in seconds. It only matters with
+// Config.performance: then one frame per second is sampled for the health
+// summary. Left at 0, the frame time is measured between ticks.
+tick :: proc(client: ^Client, dt: f64 = 0) {
 	if client == nil {
 		return
 	}
 	context.allocator = client.allocator
+	if client.performance && !client.health_sent {
+		sample_frame(client, dt)
+	}
+	tick_protocol(client)
+}
+
+@(private)
+tick_protocol :: proc(client: ^Client) {
 	pump(client)
 	start_next_protocol_request(client)
 	sync_reason(client)
@@ -800,6 +825,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	}
 	context.allocator = client.allocator
 
+	send_health(client)
 	if client.lifecycle && !client.exited_queued && core_is_active(&client.core) {
 		client.exited_queued = true
 		track(client, "game_exited")
@@ -809,7 +835,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		core_force_flush(&client.core)
 		deadline := client_now(client) + flush_timeout_ms
 		for client_now(client) < deadline {
-			tick(client)
+			tick_protocol(client)
 			idle := len(client.core.queue) == 0 && len(client.pending_feedback) == 0
 			if idle && client.protocol == nil && len(client.side) == 0 {
 				break
@@ -832,6 +858,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		free_transfer(client, t)
 	}
 	delete(client.side)
+	delete(client.health_samples)
 	for fb in client.pending_feedback {
 		delete(fb.body)
 	}
@@ -1134,6 +1161,7 @@ start_next_protocol_request :: proc(client: ^Client) {
 			strings.write_string(&b, `,"distribution":`)
 			write_json_string(&b, client.distribution)
 		}
+		strings.write_string(&b, `,"sdk":"odin/` + VERSION + `"`)
 		strings.write_byte(&b, '}')
 		t = start_request(client, "/session", strings.to_string(b), .API_Key)
 	case .Batch:

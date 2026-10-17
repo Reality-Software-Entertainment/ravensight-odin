@@ -8,6 +8,7 @@ import rs "../../ravensight"
 main :: proc() {
 	client, err := rs.create(rs.Config{
 		ingest_key = "gt_live_your_ingest_key_here",
+		performance = true, // opt in to the one health event sent at shutdown
 		callbacks = rs.Callbacks{
 			on_log = proc(user: rawptr, level: rs.Log_Level, message: string) {
 				fmt.println(message)
@@ -29,11 +30,15 @@ main :: proc() {
 		seconds: f32,
 	}
 	rs.track(client, "level_completed", Level_Cleared{level = 3, deaths = 2, seconds = 71.4})
+	rs.track_purchase(client, 499, "usd", "bundle", "starter")
+	rs.track_resource(client, rs.FLOW_SOURCE, "gold", 25)
+	rs.track_progression(client, rs.STATUS_COMPLETE, "world1", "level3", score = 1200)
+	rs.track_error(client, rs.SEVERITY_WARNING, "texture missing")
 	rs.submit_feedback(client, "Jump feels floaty on level 3", category = "bug", rating = 4)
 
 	// Your game loop. tick() is non-blocking; call it once per frame.
 	for _ in 0 ..< 120 {
-		rs.tick(client)
+		rs.tick(client, 0.016) // the last frame's seconds; optional
 		time.sleep(16 * time.Millisecond)
 	}
 

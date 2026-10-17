@@ -285,7 +285,7 @@ test_public_distribution_on_the_session_body :: proc(t: ^testing.T) {
 	defer fake_destroy(&f)
 	cl := fake_client(t, &f, Config{})
 	boot_client(t, &f, cl)
-	testing.expect_value(t, session_body_of(&f), strings.concatenate({`{"deviceId":"`, device_id(cl), `","gameVersion":"1.0.0","platform":"`, cl.platform, `"}`}, context.temp_allocator))
+	testing.expect_value(t, session_body_of(&f), strings.concatenate({`{"deviceId":"`, device_id(cl), `","gameVersion":"1.0.0","platform":"`, cl.platform, `","sdk":"odin/` + VERSION + `"}`}, context.temp_allocator))
 	close_client(cl)
 }
 
