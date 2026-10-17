@@ -3,6 +3,54 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.3.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A game that sets a
+key and none of the new options behaves as on 0.2.0, except for the
+changes listed under Breaking. `VERSION` is `"0.3.0"`.
+
+### Breaking
+
+- `create()` with an empty `ingest_key` returns an inert client and
+  `.None` instead of `nil, .Missing_Ingest_Key` (the enum value stays, and
+  is no longer returned).
+- A refused ingest key (`401`, or a `403` that is not the kill switch or a
+  refused playtest token) from settings, session, a batch, feedback or
+  suggestions now ends the run: the queue is cleared, nothing is retried,
+  `track` returns false and `flush()` sends nothing. Before, events kept
+  queueing and `flush()` allowed one more attempt. A `401` on a batch still
+  means an expired session: a new one is opened first.
+  `core_allow_one_attempt` is gone.
+- Backoff waits carry plus or minus 20 percent jitter from `core:crypto`.
+  `Retry-After` is still obeyed exactly. A bare `Core` (no `random` set)
+  has no jitter.
+- Every event's data gains an `rs_event_id` key.
+- An event whose data is over 8,192 bytes as JSON is dropped before it is
+  queued: `track` returns false, `on_flush_failed("event_too_large")`, one
+  warning for the run. Before, it was sent and refused by the server's 400.
+
+### Added
+
+- **Inert without a key.** No libcurl, no file, no request, every call a
+  quiet no-op; `Reason.No_Key` (`"no_key"`), one warning silenced by
+  `Config.optional`.
+- `Config.consent`: `.Opt_In` makes no device id and sends nothing, not
+  even the settings check, before `set_tracking_enabled(client, true)`;
+  the yes is saved in the storage file as `"optIn":true`. `.Opt_Out` stays
+  the default. Events tracked before the yes are dropped; events right
+  after it are queued while the settings check runs. Saying no again keeps
+  the device id; `reset_device_id` forgets it and returns `""`.
+  `write_tracking_enabled` takes the consent mode.
+- `Config.distribution`, sent on `POST /session` when set (trimmed, at most
+  40 UTF-16 units, no control characters; anything else is not sent and
+  logs one warning).
+- `rs_event_id` on every event whose data is a JSON object: the first 16
+  characters of the device id, the start time in hex, an 8 hex character
+  per-client nonce from `core:crypto` and a counter. It is part of the
+  queued data, so a resend after a failure carries the same id.
+- `is_enabled(client)`, `BACKOFF_JITTER`, `MAX_EVENT_BYTES`,
+  `MAX_DISTRIBUTION_LENGTH`, `random_hex` and `random_unit`.
+
 ## [0.2.0] - 2026-10-10
 
 ### Breaking

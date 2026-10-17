@@ -10,14 +10,16 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
+* Version 0.3.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
 What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
 
-* `odin test ravensight`: 58 tests pass. 33 drive the protocol state machine
-  in `core.odin` with a fake clock; 25 drive the public API in `client.odin`
-  through a fake transport and a real storage file in a temporary folder.
+* `odin test ravensight`: 68 tests pass (0.3.0). 33 drive the protocol state
+  machine in `core.odin` with a fake clock; 25 drive the public API in
+  `client.odin` through a fake transport and a real storage file in a
+  temporary folder; 10 cover the public build rules the same way.
 * `odin build examples/minimal` builds.
 * The libcurl transport was run end to end against a local mock server:
   settings, session, batch and feedback requests, the playtest header from
@@ -148,21 +150,22 @@ client and does nothing.
 
 | Call | What it does |
 | --- | --- |
-| `create(config) -> (^Client, Error)` | Creates a client. `Config{ingest_key = "..."}` is a complete configuration. Reads the saved device id and opt-out, and queues `game_started`. |
+| `create(config) -> (^Client, Error)` | Creates a client. `Config{ingest_key = "..."}` is a complete configuration. Reads the saved device id and opt-out, and queues `game_started`. With an empty key it returns an inert client and `.None` (see "Public builds"). |
 | `tick(client)` | Pumps the SDK. Call once per frame; never blocks. |
-| `track(client, name, data)` | Queues an event. `data` is optional. Returns false when tracking is off. |
-| `flush(client, force)` | Sends queued events on the next tick instead of waiting for the timer. `force` also skips an active backoff wait. After a refused key it allows one more attempt. |
+| `track(client, name, data)` | Queues an event. `data` is optional. Returns false when tracking is off, or when the data is over 8,192 bytes as JSON (dropped, `on_flush_failed("event_too_large")`). |
+| `flush(client, force)` | Sends queued events on the next tick instead of waiting for the timer. `force` also skips an active backoff wait. |
 | `submit_feedback(client, message, category, rating)` | Posts player feedback. Result arrives via callbacks. |
 | `fetch_suggestions(client)` | EXPERIMENTAL. AI generated design suggestions for your game, via `on_suggestions`. While not active it makes no request and answers `"[]"`. |
 | `set_tracking_enabled(client, bool)` | The player's choice, saved and read again on every launch. |
-| `write_tracking_enabled(bool, storage_path)` | The same, before a client exists. |
-| `is_tracking_enabled(client)` | False after the player opted out, on this run or an earlier one. |
-| `reset_device_id(client) -> string` | A new saved random id, an empty queue and no session. Returns the new id. |
+| `write_tracking_enabled(bool, storage_path, consent)` | The same, before a client exists. Pass `.Opt_In` when the client will use it. |
+| `is_tracking_enabled(client)` | False after the player opted out, on this run or an earlier one, or with `.Opt_In` before the yes. |
+| `reset_device_id(client) -> string` | A new saved random id, an empty queue and no session. Returns the new id. With `.Opt_In` and no yes, it forgets the saved id, makes none and returns `""`. |
 | `set_enabled(client, bool)` | Turns sending off and on for this run only, like `Config.start_disabled`. Not saved. |
 | `init_reason(client) -> Reason` | Why the client is not sending, or `.None`. `reason_string` gives the text form. |
 | `session_token(client) -> string` | The current session token, `""` until a session opens. |
 | `device_id(client)`, `is_playtest(client)` | The id this run sends, and whether a playtest token was found. |
 | `is_ready(client)`, `is_active(client)` | A session exists; tracking is on. |
+| `is_enabled(client)` | The same answer as `is_active`: true only while collecting. |
 | `queue_len(client)`, `stats(client)` | Queue depth and lifetime counters (`sent`, `dropped`, `flushes`, `sessions`). |
 | `shutdown(client, flush_timeout_ms)` | Queues `game_exited`, one best-effort flush, then frees everything. |
 
@@ -177,7 +180,10 @@ starts with `Ravensight: `; without a handler, warnings go to stderr.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `ingest_key` | none | Your publishable `gt_live_...` key. Required. |
+| `ingest_key` | `""` | Your publishable `gt_live_...` key, or a public `gt_pub_...` key. Empty makes the client inert. |
+| `optional` | `false` | Silences the one warning an inert client logs. |
+| `consent` | `.Opt_Out` | `.Opt_In` sends nothing, and makes no device id, until `set_tracking_enabled(client, true)`. |
+| `distribution` | `""` | A short label for this build, sent on the session. At most 40 characters, no control characters, otherwise not sent. |
 | `api_url` | `https://api.ravensight.io` | Only change this if you self host. With or without `/api/v1` and trailing slashes. |
 | `game_version` | `1.0.0` | Reported with every session. |
 | `platform` | build target OS | Reported with every session. |
@@ -213,13 +219,75 @@ change:
 | Reason | When | What happens |
 | --- | --- | --- |
 | `.None` | Ready, or nothing has gone wrong yet. | |
-| `.Disabled` | `start_disabled`, `set_enabled(false)` or the player's opt-out. | No request of any kind. |
-| `.Invalid_Key` | A `401`, or a `403` without one of the codes below, from settings, session or suggestions. | Automatic sending stops for the run; events keep queueing (the cap applies); `flush()` makes one more attempt. Logged once as a warning. |
+| `.No_Key` | Created with an empty `ingest_key`. | Inert: no request, no file, no libcurl. |
+| `.Disabled` | `start_disabled`, `set_enabled(false)`, the player's opt-out, or `.Opt_In` and no yes yet. | No request of any kind. |
+| `.Invalid_Key` | A `401`, or a `403` without one of the codes below, from settings, session, a batch, feedback or suggestions. | The run ends: the queue is cleared and nothing more is sent or retried, not even by `flush()`. Logged once as a warning. A `401` on a batch is an expired session instead: a new one is opened first. |
 | `.Tracking_Disabled` | The game's tracking is switched off in the dashboard (`GET /settings`, or a `403 tracking_disabled` from any request). | The queue is cleared and nothing more is sent this run. |
-| `.Offline` | No answer, a timeout or a server error. | Retried after 10 seconds, doubling to 5 minutes. |
+| `.Offline` | No answer, a timeout or a server error. | Retried after 10 seconds, doubling to 5 minutes, each wait spread by plus or minus 20 percent. |
 | `.Rate_Limited` | A `429`. | Retried after exactly `Retry-After` seconds. |
 | `.Session_Failed` | `POST /session` failed, or a playtest token is unusable. | Retried, except for a playtest token, which stops the run. |
 | `.Playtest_Job_Closed` | The playtest run's job closed. | The queue is cleared and nothing more is sent this run. |
+
+## Public builds
+
+For a game anyone can download, fork or build from source: a demo, a jam
+entry, an open source project. Nothing here changes a game that sets a key
+and none of these options.
+
+* **No key, no analytics.** `create()` with an empty `ingest_key` no longer
+  returns `.Missing_Ingest_Key`. It returns an inert client and `.None`:
+  libcurl is never initialized, no file is written, no request is made, and
+  every call is a quiet no-op. `init_reason` is `.No_Key` (`"no_key"`),
+  `is_enabled` is false, and one warning is logged (`optional = true`
+  silences it). So a public repository can ship with no key in it, and a
+  clone or a development build sends nothing.
+* **Inject the key at build time, never commit it.** Use a public `gt_pub_`
+  key for builds anyone can download, passed in by your release build:
+
+  ```odin
+  RAVENSIGHT_KEY :: #config(RAVENSIGHT_KEY, "") // empty unless the build defines it
+
+  client, _ := rs.create(rs.Config{ingest_key = RAVENSIGHT_KEY, optional = true})
+  ```
+
+  ```bash
+  odin build . -define:RAVENSIGHT_KEY=$RAVENSIGHT_PUBLIC_KEY   # release builds only
+  ```
+
+* **`consent = .Opt_In`** sends nothing until the player says yes: no device
+  id is made, and not even the settings check is sent, before
+  `set_tracking_enabled(client, true)`. The yes is saved in the storage file
+  as `"optIn":true`, and `set_tracking_enabled(client, false)` removes it.
+  `.Opt_Out`, the default, keeps the 0.2.0 behaviour. Events tracked before
+  the yes are dropped (`track` returns false), not held for later; events
+  tracked right after it are queued while the settings check runs.
+  `device_id(client)` is `""` before the first yes. Saying no again stops
+  everything but keeps the device id; to forget it too, call
+  `reset_device_id(client)`.
+* **`distribution`** is a short label of your own, such as
+  `"steam-release"`, `"itch-demo"` or `"source-build"`, sent on the session
+  so you can tell builds apart. It is not sent when empty.
+* **`rs_event_id`** is added to every event's data: the first 16 characters
+  of the device id, the start time in hex, a random 8 hex character value
+  made once per client from `core:crypto`, and a counter. It stays with the
+  queued event, so an event sent again after a failure carries the same id
+  and the server can recognise it. The queue is in memory only; it is not
+  saved between launches. Event data that is not a JSON object is sent as
+  it is, without the id.
+* **Size cap.** An event whose data is over 8,192 bytes as JSON is dropped
+  before it is queued: `track` returns false, `on_flush_failed` gets
+  `"event_too_large"`, `stats().dropped` counts it, and one warning is
+  logged for the run.
+* **A refused key ends the run.** See `.Invalid_Key` above. A later
+  `set_tracking_enabled(client, true)` saves the choice and restarts
+  nothing.
+
+## Compatibility
+
+| ravensight-odin | Odin | API | Notes |
+| --- | --- | --- | --- |
+| 0.2.0 | `dev-2026-08`, libcurl | `/api/v1` | The shared SDK contract. |
+| 0.3.0 | `dev-2026-08`, libcurl | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
 
 ## About your ingest key
 
@@ -366,6 +434,7 @@ ravensight/
   curl.odin         minimal libcurl foreign binding (multi interface).
   core_test.odin    deterministic tests for every retry path.
   client_test.odin  the public API through a fake transport.
+  public_build_test.odin  the public build rules, through the same fake.
 ```
 
 **Why a tick pump instead of a background thread:** games already own a main
@@ -379,7 +448,7 @@ get the last batch out.
 ## Running the tests
 
 ```bash
-odin test ravensight          # 58 tests, no network, no engine
+odin test ravensight          # 68 tests, no network, no engine
 odin build examples/minimal   # the example compiles and links libcurl
 ```
 
