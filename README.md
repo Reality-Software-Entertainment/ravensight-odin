@@ -265,7 +265,7 @@ and none of these options.
   everything but keeps the device id; to forget it too, call
   `reset_device_id(client)`.
 * **`distribution`** is a short label of your own, such as
-  `"steam-release"`, `"itch-demo"` or `"source-build"`, sent on the session
+  `"native-release"`, `"itch-demo"` or `"source-build"`, sent on the session
   so you can tell builds apart. It is not sent when empty.
 * **`rs_event_id`** is added to every event's data: the first 16 characters
   of the device id, the start time in hex, a random 8 hex character value

@@ -97,7 +97,7 @@ Config :: struct {
 	// set_tracking_enabled(client, true). The zero value .Opt_Out keeps the
 	// 0.2.0 behaviour.
 	consent:                  Consent,
-	// A short label of your own for this build, such as "steam-release" or
+	// A short label of your own for this build, such as "native-release" or
 	// "itch-demo", sent on POST /session as distribution. Trimmed; at most
 	// 40 characters, no control characters, otherwise not sent (one
 	// warning). "" sends nothing.

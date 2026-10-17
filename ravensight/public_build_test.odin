@@ -270,7 +270,7 @@ test_public_distribution_on_the_session_body :: proc(t: ^testing.T) {
 		testing.expect_value(t, count_logs(&rec, "distribution must be at most 40"), bad ? 1 : 0, loc = loc)
 		close_client(cl)
 	}
-	check_label(t, "  steam-demo ", "steam-demo")
+	check_label(t, "  native-demo ", "native-demo")
 	forty := strings.repeat("y", 40, context.temp_allocator)
 	check_label(t, forty, forty)
 	check_label(t, strings.repeat("x", 41, context.temp_allocator), "")
