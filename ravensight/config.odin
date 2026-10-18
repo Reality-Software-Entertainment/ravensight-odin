@@ -35,7 +35,7 @@ clear_config :: proc(cl: ^Client, erase: bool) {
 }
 
 config_name :: proc(s: string, limit: int, variant := false) -> bool {
- if len(s)==0 || len(s)>limit || s=="__proto__" || s=="constructor" || s=="prototype" { return false }
+ if len(s)==0 || len(s)>limit { return false }
  for c, i in s {
   if i==0 && !(c>='a' && c<='z') { return false }
   if !(c>='a' && c<='z' || c>='0' && c<='9' || c=='_' || variant && c=='-') { return false }
@@ -64,7 +64,7 @@ config_install :: proc(cl: ^Client, body: []u8) -> bool {
  for c in etag[1:65] { if !(c>='0' && c<='9' || c>='a' && c<='f') { return false } }
  for key, value in values {
   encoded, e := json.unparse(value, allocator=context.temp_allocator)
-  if !config_name(key,64) || e!=nil || len(encoded)>8192 || !config_safe(value) { return false }
+  if !config_name(key,64) || key=="constructor" || key=="prototype" || e!=nil || len(encoded)>8192 || !config_safe(value) { return false }
  }
  seen := make(map[string]bool, context.temp_allocator)
  for a in assignments {

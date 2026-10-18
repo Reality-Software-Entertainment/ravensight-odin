@@ -117,3 +117,18 @@ test_config_limits_scope_and_callback :: proc(t:^testing.T) {
  bad=config_test_replace(`{"key":"tutorial","variant":"short"}`,strings.to_string(repeated))
  testing.expect(t,!config_install(cl,transmute([]u8)bad))
 }
+
+@(test)
+test_config_reserved_property_names_and_experiment_labels :: proc(t:^testing.T) {
+ f:Fake; fake_init(&f); defer fake_destroy(&f)
+ cl:=fake_client(t,&f,Config{}); defer close_client(cl)
+ words := []string{"constructor","prototype"}
+ for word in words {
+  bad:=config_test_replace(`"difficulty":2`,fmt.tprintf(`"%s":2`,word))
+  testing.expect(t,!config_install(cl,transmute([]u8)bad))
+  bad=config_test_replace(`"difficulty":2`,fmt.tprintf(`"difficulty":{"%s":2}`,word))
+  testing.expect(t,!config_install(cl,transmute([]u8)bad))
+  good:=config_test_replace(`"key":"tutorial","variant":"short"`,fmt.tprintf(`"key":"%s","variant":"%s"`,word,word))
+  testing.expect(t,config_install(cl,transmute([]u8)good))
+ }
+}

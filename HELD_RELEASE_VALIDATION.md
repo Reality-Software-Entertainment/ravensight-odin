@@ -22,3 +22,8 @@ Physical-device and live-service validation is not implied by these checks.
 Publishing, tags, marketplace submission and deployments remain held pending
 owner approval. Older README test counts describe their earlier branch runs;
 this file records the combined candidate.
+
+Config identifier compatibility audit: 91 Odin tests passed with memory tracking enabled and no leak warnings.
+Config property keys reject constructor/prototype, including nested JSON properties.
+Experiment keys and variant labels may use those words as string values, matching
+the server contract. Regression coverage distinguishes those cases. Publishing remains held.
