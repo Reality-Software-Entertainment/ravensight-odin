@@ -3,6 +3,16 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.3.1] - Unreleased (held)
+
+- Fetch remote config on session start with scoped disk caching, ETag revalidation
+  and offline fallback. Add typed getters, owned JSON copies and config-ready callbacks.
+- Attach validated experiment assignments only to newly queued events.
+- Preserve consent, playtest isolation, identity reset and stale-response protection.
+- Validate payload limits before accepting config; cap curl response accumulation.
+- Verified 90 Odin tests, package check and the minimal example build locally.
+  No publication, tags or deployment has occurred.
+
 ## [0.3.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A game that sets a

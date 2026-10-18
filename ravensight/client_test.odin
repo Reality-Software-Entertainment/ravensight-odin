@@ -229,6 +229,8 @@ boot_client :: proc(t: ^testing.T, f: ^Fake, cl: ^Client, loc := #caller_locatio
 	answer_next(t, f, "/settings", 200, `{"trackingEnabled":true}`, loc = loc)
 	tick(cl)
 	answer_next(t, f, "/session", 201, `{"token":"tok_1","expiresIn":86400}`, loc = loc)
+	idx:=open_request(f)
+	if idx>=0 && strings.has_prefix(f.requests[idx].path,"/ingest/config?") { answer(f,idx,0) }
 }
 
 // --- Disabled and opt-out -------------------------------------------------------
@@ -394,7 +396,7 @@ test_client_device_id_is_saved_and_reused :: proc(t: ^testing.T) {
 	c := fake_client(t, &f, Config{device_id = "my_own_id"})
 	testing.expect_value(t, device_id(c), "my_own_id")
 	boot_client(t, &f, c)
-	testing.expect(t, strings.contains(f.requests[len(f.requests) - 1].body, `"deviceId":"my_own_id"`))
+	testing.expect(t, strings.contains(f.requests[len(f.requests) - 2].body, `"deviceId":"my_own_id"`))
 	close_client(c)
 	testing.expect_value(t, load_identity(storage_in(&f), context.temp_allocator).device_id, id)
 
@@ -718,12 +720,12 @@ test_client_playtest_identity_header_and_no_storage :: proc(t: ^testing.T) {
 		testing.expect(t, has_header(r, "X-Ravensight-Playtest: pt_tok"), r.path)
 	}
 	testing.expect(t, strings.contains(f.requests[1].body, `"deviceId":"pt-run42"`))
-	batch := f.requests[2].body
-	testing.expect_value(t, f.requests[2].path, "/track/batch")
+	batch := f.requests[3].body
+	testing.expect_value(t, f.requests[3].path, "/track/batch")
 	testing.expect(t, strings.contains(batch, `{"level":1,"synthetic":true,"pt_source":"sdk","pt_run":"run42","pt_job":"job7","persona":"speedrunner","rs_event_id":"pt-run42-`), batch)
 
 	// The run's job closes: permanent stop, queue cleared, logged once.
-	answer(&f, 2, 403, `{"error":"playtest_job_closed"}`)
+	answer(&f, 3, 403, `{"error":"playtest_job_closed"}`)
 	testing.expect_value(t, init_reason(cl), Reason.Playtest_Job_Closed)
 	testing.expect_value(t, queue_len(cl), 0)
 	n := len(f.requests)
@@ -808,7 +810,7 @@ test_client_batch_body_and_auth_headers :: proc(t: ^testing.T) {
 		track(cl, fmt.tprintf("e%d", i))
 	}
 	tick(cl) // 51 queued: one full batch goes at once, no timer wait
-	r := f.requests[2]
+	r := f.requests[3]
 	testing.expect_value(t, r.path, "/track/batch")
 	testing.expect(t, has_header(r, "X-Session-Token: tok_1"))
 	testing.expect_value(t, strings.count(r.body, `"event":`), MAX_BATCH_SIZE)

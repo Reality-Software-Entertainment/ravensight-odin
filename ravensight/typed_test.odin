@@ -380,7 +380,7 @@ test_session_request_carries_sdk_name_and_version :: proc(t: ^testing.T) {
 	tick(cl)
 	idx := open_request(&f)
 	testing.expect_value(t, f.requests[idx].path, "/session")
-	testing.expect(t, strings.contains(f.requests[idx].body, `"sdk":"odin/0.3.0"`))
+	testing.expect(t, strings.contains(f.requests[idx].body, `"sdk":"odin/0.3.1"`))
 	close_client(cl)
 }
 

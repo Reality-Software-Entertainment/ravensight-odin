@@ -16,7 +16,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-VERSION :: "0.3.0"
+VERSION :: "0.3.1"
 DEFAULT_API_URL :: "https://api.ravensight.io"
 DEFAULT_REQUEST_TIMEOUT_MS :: 15_000
 // shutdown() holds the quit for at most this long by default.
@@ -63,6 +63,7 @@ Log_Level :: enum {
 Callbacks :: struct {
 	user:                  rawptr,
 	on_session_ready:      proc(user: rawptr),
+	on_config_ready: proc(user: rawptr, fresh: bool),
 	// `reason` is one of the Reason strings, e.g. "invalid_key", "offline".
 	on_session_failed:     proc(user: rawptr, reason: string),
 	on_tracking_disabled:  proc(user: rawptr),
@@ -140,11 +141,13 @@ Config :: struct {
 }
 
 Side_Kind :: enum {
+	Config,
 	Feedback,
 	Suggestions,
 }
 
 Transfer :: struct {
+	config_generation: int,
 	easy:     CURL, // nil when a test transport carries the request
 	kind:     Request_Kind, // protocol transfers; .None for side transfers
 	is_side:  bool,
@@ -183,6 +186,7 @@ Transport :: struct {
 }
 
 Client :: struct {
+	remote: Remote_Config,
 	allocator:          runtime.Allocator,
 	core:               Core,
 	cb:                 Callbacks,
@@ -348,6 +352,7 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 		cl.device_id = strings.clone(len(override) > 0 ? override : cl.saved_device_id)
 	}
 
+	load_config_cache(cl)
 	maybe_queue_game_started(cl)
 	cl.last_reason = core_reason(&cl.core)
 	return cl, .None
@@ -484,6 +489,7 @@ track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
 	if len(name) == 0 {
 		return false
 	}
+	data_json = with_config_exposures(client, data_json)
 	data_json = with_event_id(client, data_json)
 	if len(data_json) > MAX_EVENT_BYTES {
 		client.core.stats.dropped += 1
@@ -520,8 +526,11 @@ set_enabled :: proc(client: ^Client, enabled: bool) {
 		return
 	}
 	context.allocator = client.allocator
+	if !enabled { clear_config(client, true) }
 	core_set_enabled(&client.core, enabled)
 	if enabled {
+		load_config_cache(client)
+		if core_is_session_valid(&client.core, client_now(client)) { fetch_config(client) }
 		maybe_queue_game_started(client)
 	} else {
 		drop_pending_feedback(client, "disabled")
@@ -561,8 +570,11 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled, opted_in = client.saved_opt_in}) {
 		log(client, .Warning, "Ravensight: could not save the analytics choice to the storage file.")
 	}
+	if !enabled { clear_config(client, true) }
 	core_set_opted_out(&client.core, !enabled)
 	if enabled {
+		load_config_cache(client)
+		if core_is_session_valid(&client.core, client_now(client)) { fetch_config(client) }
 		maybe_queue_game_started(client)
 	} else {
 		drop_pending_feedback(client, "disabled")
@@ -594,6 +606,7 @@ reset_device_id :: proc(client: ^Client) -> string {
 	if client.core.inert {
 		return client.device_id
 	}
+	clear_config(client, true)
 	if client.consent == .Opt_In && client.core.opted_out {
 		// Not opted in: forget any saved id and make none until the yes.
 		if len(client.storage_path) > 0 && os.exists(client.storage_path) {
@@ -867,6 +880,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		curl_multi_cleanup(client.multi)
 	}
 
+	clear_config(client, false)
 	core_destroy(&client.core)
 	delete(client.api_url)
 	delete(client.ingest_key)
@@ -1033,6 +1047,7 @@ write_cb :: proc "c" (ptr: [^]u8, size: c.size_t, nmemb: c.size_t, user: rawptr)
 	t := (^Transfer)(user)
 	context = t.ctx
 	n := int(size) * int(nmemb)
+	if t.is_side && t.side == .Config && len(t.body_buf) + n > 450_000 { return 0 }
 	if n > 0 {
 		append(&t.body_buf, ..ptr[:n])
 	}
@@ -1042,7 +1057,7 @@ write_cb :: proc "c" (ptr: [^]u8, size: c.size_t, nmemb: c.size_t, user: rawptr)
 // Starts one HTTP request, through libcurl or the installed test transport.
 // `body` == "" means GET. Returns nil when the request could not be started.
 @(private)
-start_request :: proc(client: ^Client, path: string, body: string, auth: Auth) -> ^Transfer {
+start_request :: proc(client: ^Client, path: string, body: string, auth: Auth, extra_headers: []string = nil) -> ^Transfer {
 	url := fmt.tprintf("%s%s", client.api_url, path)
 	headers := make([dynamic]string, context.temp_allocator)
 	if len(body) > 0 {
@@ -1058,6 +1073,7 @@ start_request :: proc(client: ^Client, path: string, body: string, auth: Auth) -
 		append(&headers, fmt.tprintf("X-Ravensight-Playtest: %s", client.playtest.token))
 	}
 
+	append(&headers, ..extra_headers)
 	t := new(Transfer)
 	t.body_buf = make([dynamic]u8)
 	t.ctx = context
@@ -1311,12 +1327,14 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 
 @(private)
 handle_side_response :: proc(client: ^Client, t: ^Transfer, status: int) {
+	if t.side == .Config { config_response(client, t, status); return }
 	parsed, ok := parse_body(t.body_buf[:])
 	defer if ok {json.destroy_value(parsed)}
 	obj, is_obj := parsed.(json.Object)
 	code := error_code_of(obj, is_obj)
 
 	switch t.side {
+	case .Config:
 	case .Feedback:
 		if status == 201 {
 			if client.cb.on_feedback_submitted != nil {
@@ -1375,6 +1393,7 @@ handle_side_response :: proc(client: ^Client, t: ^Transfer, status: int) {
 
 @(private)
 dispatch :: proc(client: ^Client, sig: Signals) {
+	if !core_is_active(&client.core) { clear_config(client, true) }
 	if sig.key_refused && !client.warned_key {
 		client.warned_key = true
 		log(client, .Warning, INVALID_KEY_WARNING)
@@ -1401,6 +1420,7 @@ dispatch :: proc(client: ^Client, sig: Signals) {
 		log(client, .Info, fmt.tprintf("Ravensight: settings check failed (%s), assuming tracking enabled.", len(sig.reason) > 0 ? sig.reason : "offline"))
 	}
 	if sig.session_ready {
+		fetch_config(client)
 		if client.cb.on_session_ready != nil {
 			client.cb.on_session_ready(client.cb.user)
 		}

@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.3.0. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.3.1. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -507,3 +507,39 @@ and macOS with Odin `dev-2026-08`.
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+## Remote config and experiments (0.3.1)
+
+The client fetches remote config when a session opens. Continue calling `tick`
+from your main loop. You can also call `fetch_config(client)` explicitly; a
+second call while one is pending does nothing. No fetch occurs before consent,
+without a key, or while tracking is disabled. Config uses the existing ingest
+key and normalized API URL. Values are public game settings, never secrets.
+
+```odin
+speed := ravensight.get_config_number(client, "speed", 4)
+show_hint := ravensight.get_config_bool(client, "show_hint", true)
+label := ravensight.get_config_string(client, "label", "Welcome")
+layout := ravensight.get_config_json(client, "layout", "{}")
+defer delete(layout)
+```
+
+Missing keys and wrong scalar types return the supplied fallback. Strings are
+borrowed until the next successful fetch, identity reset or shutdown. JSON text
+is an owned copy in the supplied allocator (the current allocator by default).
+Set `Callbacks.on_config_ready(user, fresh)` to react to completion. `fresh`
+means a validated 200 or matching 304; false means offline/error fallback.
+
+The last validated response is cached beside the identity file, scoped by a
+SHA-256 digest of API URL, ingest key, device, platform and build. Cached values
+are available at startup even offline. The key itself is never saved in the
+cache. ETags make unchanged responses free; a fresh response consumes one
+ordinary event. Playtest clients keep config only in memory. Opt-out and
+identity reset clear the current cache and invalidate pending responses.
+
+Accepted experiment assignments automatically add `rs_exp_<key>` to newly
+tracked events, including typed helpers. Existing queued events retain their
+original assignments through retries. Caller-supplied exposure labels are
+removed. Responses are limited to 50 keys, 8 KiB per value, 10 experiments,
+bounded JSON depth and valid names; malformed responses preserve the prior
+cache. Network response accumulation is capped at 450 KB.
