@@ -3,6 +3,13 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.4.0] - Prepared for release
+
+- Add explicit, consented Player Reports from caller-provided PNG bytes, with stable report/session binding and explicit retries. No automatic capture or extra analytics events.
+- Separate signed upload credentials from API credentials; bound response sizes and reject redirects.
+- Preserve existing Player Report pricing and document pending, complete and canceled outcomes.
+- Offline protocol coverage passes; live uploads and native game capture remain unverified.
+
 ## [0.3.1] - Unreleased (held)
 
 - Fetch remote config on session start with scoped disk caching, ETag revalidation

@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.3.1. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.4.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -543,3 +543,41 @@ original assignments through retries. Caller-supplied exposure labels are
 removed. Responses are limited to 50 keys, 8 KiB per value, 10 experiments,
 bounded JSON depth and valid names; malformed responses preserve the prior
 cache. Network response accumulation is capped at 450 KB.
+
+## Explicit PNG Player Reports
+
+`create_report(Report_Input)` prepares caller-provided PNG bytes after your own
+preview/consent UI; it never captures the desktop. Supply a unique stable
+`client_id`, `message`, `png`, and `consent = true`, optionally `category` and
+`captured_at` (Unix seconds). The image must be no larger than 1,000,000 bytes
+and 1600 × 1600 with a valid PNG/IHDR header. The server performs full decoding.
+
+`submit_report(client, report, callback, user)` uses the current active session
+and existing asynchronous libcurl pump. The callback receives `(user, status,
+reason)` on the calling thread; strings are borrowed for the callback. Keep the
+report alive until completion and call `destroy_report(report)` afterwards.
+Destruction refuses an in-flight report. `processing` means accepted but not yet
+visible; reuse the same prepared object in `submit_report` to poll or retry.
+`complete` means the screenshot can be viewed in the app's **Player Reports**.
+
+The stable report/session binding prevents retries from becoming new reports.
+A changed session or opted-out player refuses submission. There are no automatic
+retries, screen captures, disk queues or added player analytics events. Existing
+Player Report pricing applies. Signed S3 uploads have their own HTTPS request,
+with no ingest/session/playtest credentials; multipart files are binary-length
+counted (including NUL bytes), redirects are not enabled, and response bodies
+are bounded to 64 KiB. Host callbacks should not destroy the SDK client while
+inside its network callback. On shutdown, pending reports are detached; destroy
+them afterwards and do not reuse them with another client.
+
+Pending server submissions expire after 15 minutes. The server grants at most
+two upload authorizations per submission, so repeated ambiguous upload retries
+can exhaust that allowance. Keep the same prepared report and client ID; do not
+create another report to bypass a failed or uncertain submission. `canceled` is
+terminal. Releasing the local report only frees local memory; it does not send
+a server cancellation or request a refund. Text limits are checked in UTF-8
+bytes, which is conservative for non-ASCII text.
+
+The offline tests validate the actual SDK state machine against fake transport,
+including consent, multipart bytes, retries and credential separation. Production
+uploads, native game captures and non-macOS builds remain unverified.

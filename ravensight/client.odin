@@ -16,7 +16,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-VERSION :: "0.3.1"
+VERSION :: "0.4.0"
 DEFAULT_API_URL :: "https://api.ravensight.io"
 DEFAULT_REQUEST_TIMEOUT_MS :: 15_000
 // shutdown() holds the quit for at most this long by default.
@@ -141,12 +141,15 @@ Config :: struct {
 }
 
 Side_Kind :: enum {
+ Report,
 	Config,
 	Feedback,
 	Suggestions,
 }
 
 Transfer :: struct {
+ report: ^Player_Report,
+ report_stage: Report_Stage,
 	config_generation: int,
 	easy:     CURL, // nil when a test transport carries the request
 	kind:     Request_Kind, // protocol transfers; .None for side transfers
@@ -868,6 +871,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		client.protocol = nil
 	}
 	for t in client.side {
+  if t.report != nil { t.report.pending = false }
 		free_transfer(client, t)
 	}
 	delete(client.side)
@@ -1039,6 +1043,7 @@ send_pending_feedback :: proc(client: ^Client) {
 // session token.
 @(private)
 Auth :: enum {
+ None,
 	API_Key,
 	Session_Token,
 }
@@ -1048,6 +1053,7 @@ write_cb :: proc "c" (ptr: [^]u8, size: c.size_t, nmemb: c.size_t, user: rawptr)
 	context = t.ctx
 	n := int(size) * int(nmemb)
 	if t.is_side && t.side == .Config && len(t.body_buf) + n > 450_000 { return 0 }
+ if t.is_side && t.side == .Report && len(t.body_buf) + n > 65_536 { return 0 }
 	if n > 0 {
 		append(&t.body_buf, ..ptr[:n])
 	}
@@ -1057,19 +1063,20 @@ write_cb :: proc "c" (ptr: [^]u8, size: c.size_t, nmemb: c.size_t, user: rawptr)
 // Starts one HTTP request, through libcurl or the installed test transport.
 // `body` == "" means GET. Returns nil when the request could not be started.
 @(private)
-start_request :: proc(client: ^Client, path: string, body: string, auth: Auth, extra_headers: []string = nil) -> ^Transfer {
-	url := fmt.tprintf("%s%s", client.api_url, path)
+start_request :: proc(client: ^Client, path: string, body: string, auth: Auth, extra_headers: []string = nil, absolute_url := false) -> ^Transfer {
+	url := absolute_url ? path : fmt.tprintf("%s%s", client.api_url, path)
 	headers := make([dynamic]string, context.temp_allocator)
-	if len(body) > 0 {
+	if len(body) > 0 && !absolute_url {
 		append(&headers, "Content-Type: application/json")
 	}
 	switch auth {
+ case .None:
 	case .API_Key:
 		append(&headers, fmt.tprintf("X-API-Key: %s", client.ingest_key))
 	case .Session_Token:
 		append(&headers, fmt.tprintf("X-Session-Token: %s", client.core.session_token))
 	}
-	if len(client.playtest.token) > 0 {
+	if !absolute_url && len(client.playtest.token) > 0 {
 		append(&headers, fmt.tprintf("X-Ravensight-Playtest: %s", client.playtest.token))
 	}
 
@@ -1109,6 +1116,7 @@ start_request :: proc(client: ^Client, path: string, body: string, auth: Auth, e
 	curl_setopt_str(easy, CURLOPT_USERAGENT, ua)
 	if len(body) > 0 {
 		cbody := strings.clone_to_cstring(body, context.temp_allocator)
+		curl_setopt_long(easy, CURLOPT_POSTFIELDSIZE, c.long(len(body)))
 		curl_setopt_str(easy, CURLOPT_COPYPOSTFIELDS, cbody) // curl copies the body
 	} else {
 		curl_setopt_long(easy, CURLOPT_HTTPGET, 1)
@@ -1328,12 +1336,14 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 @(private)
 handle_side_response :: proc(client: ^Client, t: ^Transfer, status: int) {
 	if t.side == .Config { config_response(client, t, status); return }
+ if t.side == .Report { report_response(client, t, status); return }
 	parsed, ok := parse_body(t.body_buf[:])
 	defer if ok {json.destroy_value(parsed)}
 	obj, is_obj := parsed.(json.Object)
 	code := error_code_of(obj, is_obj)
 
 	switch t.side {
+ case .Report:
 	case .Config:
 	case .Feedback:
 		if status == 201 {
