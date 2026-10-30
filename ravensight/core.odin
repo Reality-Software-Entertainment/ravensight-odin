@@ -82,7 +82,7 @@ reason_string :: proc(r: Reason) -> string {
 Core_Event :: struct {
 	name:        string, // owned by the core
 	data_json:   string, // owned by the core; pre-serialized JSON object, "" means {}
-	timestamp_s: i64,    // unix seconds, captured when the event happened
+	timestamp_ms: i64,   // unix milliseconds, captured when the event happened
 	is_error:    bool,   // an error event: queued behind gameplay events
 	tag:         int,    // the caller's marker, carried untouched (0 for none)
 }
@@ -342,7 +342,7 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 	evt := Core_Event{
 		name        = strings.clone(name, c.allocator),
 		data_json   = strings.clone(data_json, c.allocator),
-		timestamp_s = now_ms / 1000,
+		timestamp_ms = now_ms,
 		is_error    = is_error,
 		tag         = tag,
 	}
@@ -681,7 +681,7 @@ core_clear_queue :: proc(c: ^Core) {
 // --- Wire format --------------------------------------------------------------
 
 // Builds the exact JSON body for POST /track/batch:
-//   {"events":[{"event":"...","data":{...},"timestamp":123}, ...]}
+//   {"events":[{"event":"...","data":{...},"timestamp":1700000000123}, ...]}
 // Event names are escaped; data_json is spliced in verbatim (it was
 // serialized by the client layer already).
 build_batch_body :: proc(events: []Core_Event, allocator := context.allocator) -> string {
@@ -696,7 +696,7 @@ build_batch_body :: proc(events: []Core_Event, allocator := context.allocator) -
 		strings.write_string(&b, `,"data":`)
 		strings.write_string(&b, len(evt.data_json) > 0 ? evt.data_json : "{}")
 		strings.write_string(&b, `,"timestamp":`)
-		strings.write_i64(&b, evt.timestamp_s)
+		strings.write_i64(&b, evt.timestamp_ms)
 		strings.write_byte(&b, '}')
 	}
 	strings.write_string(&b, `]}`)

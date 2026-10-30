@@ -445,7 +445,15 @@ test_client_game_started_first_with_create_time_and_once :: proc(t: ^testing.T) 
 	cl := fake_client(t, &f, Config{})
 	testing.expect_value(t, queue_len(cl), 1)
 	testing.expect_value(t, cl.core.queue[0].name, "game_started")
-	testing.expect_value(t, cl.core.queue[0].timestamp_s, T0 / 1000)
+	testing.expect_value(t, cl.core.queue[0].timestamp_ms, T0)
+
+	// Two events inside one second keep their own milliseconds.
+	f.now += 200
+	track(cl, "same_second_a")
+	f.now += 300
+	track(cl, "same_second_b")
+	testing.expect_value(t, cl.core.queue[1].timestamp_ms, T0 + 200)
+	testing.expect_value(t, cl.core.queue[2].timestamp_ms, T0 + 500)
 
 	// Tracked before the first tick, still behind game_started.
 	f.now += 3_000
@@ -459,7 +467,7 @@ test_client_game_started_first_with_create_time_and_once :: proc(t: ^testing.T) 
 	testing.expect_value(t, last.path, "/track/batch")
 	testing.expect_value(t, strings.count(last.body, `"game_started"`), 1)
 	testing.expect(t, strings.index(last.body, "game_started") < strings.index(last.body, "level_start"))
-	testing.expect(t, strings.contains(last.body, fmt.tprintf(`"timestamp":%d`, T0 / 1000)))
+	testing.expect(t, strings.contains(last.body, fmt.tprintf(`"timestamp":%d`, T0)))
 	close_client(cl)
 }
 

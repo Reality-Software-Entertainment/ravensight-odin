@@ -3,6 +3,15 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [Unreleased]
+
+### Changed
+
+- Event timestamps are unix milliseconds, so events in one second keep their
+  order in funnels and sessions. `Core_Event.timestamp_s` is now
+  `timestamp_ms`. Needs a Ravensight server that keeps milliseconds. Older
+  versions keep working unchanged.
+
 ## [0.5.0] - 2026-11-06
 
 - Automatic error capture, installed with one host line after `create()`:

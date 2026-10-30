@@ -433,13 +433,13 @@ test_json_string_escaping :: proc(t: ^testing.T) {
 @(test)
 test_batch_body_wire_format :: proc(t: ^testing.T) {
 	events := [?]Core_Event{
-		{name = "level_up", data_json = `{"level":3}`, timestamp_s = 1700000001},
-		{name = `weird "name"`, data_json = "", timestamp_s = 1700000002},
+		{name = "level_up", data_json = `{"level":3}`, timestamp_ms = 1700000001250},
+		{name = `weird "name"`, data_json = "", timestamp_ms = 1700000001700},
 	}
 	body := build_batch_body(events[:], context.temp_allocator)
 	expected := `{"events":[` +
-		`{"event":"level_up","data":{"level":3},"timestamp":1700000001},` +
-		`{"event":"weird \"name\"","data":{},"timestamp":1700000002}]}`
+		`{"event":"level_up","data":{"level":3},"timestamp":1700000001250},` +
+		`{"event":"weird \"name\"","data":{},"timestamp":1700000001700}]}`
 	testing.expect_value(t, body, expected)
 }
 
