@@ -83,6 +83,7 @@ Core_Event :: struct {
 	name:        string, // owned by the core
 	data_json:   string, // owned by the core; pre-serialized JSON object, "" means {}
 	timestamp_s: i64,    // unix seconds, captured when the event happened
+	is_error:    bool,   // an error event: queued behind gameplay events
 }
 
 Request_Kind :: enum {
@@ -296,25 +297,53 @@ core_discard_queue :: proc(c: ^Core) {
 // Queues one event. `data_json` must be a serialized JSON object ("" is
 // treated as {}); both strings are cloned. Returns false when tracking is
 // off (server kill switch or local opt-out).
-core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64) -> bool {
+//
+// Gameplay events keep their place ahead of errors: an error is appended at
+// the end, and a gameplay event is placed in front of the errors queued
+// after the batch in flight, so an error storm can never hold gameplay back.
+// When the queue is full the oldest error goes first, then the oldest event.
+core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_error := false) -> bool {
 	if !core_is_active(c) || len(name) == 0 {
 		return false
 	}
 
+	// Events in the batch in flight are never moved or dropped here.
+	floor := c.in_flight == .Batch ? min(c.in_flight_batch, len(c.queue)) : 0
 	for len(c.queue) >= c.max_queue {
-		// Drop oldest so the newest always survive.
-		evt := c.queue[0]
+		victim := 0
+		for i in floor ..< len(c.queue) {
+			if c.queue[i].is_error {
+				victim = i
+				break
+			}
+		}
+		if victim == 0 && floor > 0 && floor < len(c.queue) {
+			victim = floor
+		}
+		evt := c.queue[victim]
 		delete(evt.name, c.allocator)
 		delete(evt.data_json, c.allocator)
-		ordered_remove(&c.queue, 0)
+		ordered_remove(&c.queue, victim)
+		if victim < floor {
+			c.in_flight_batch -= 1
+			floor -= 1
+		}
 		c.stats.dropped += 1
 	}
 
-	append(&c.queue, Core_Event{
+	evt := Core_Event{
 		name        = strings.clone(name, c.allocator),
 		data_json   = strings.clone(data_json, c.allocator),
 		timestamp_s = now_ms / 1000,
-	})
+		is_error    = is_error,
+	}
+	at := len(c.queue)
+	if !is_error {
+		for at > floor && c.queue[at - 1].is_error {
+			at -= 1
+		}
+	}
+	inject_at(&c.queue, at, evt)
 
 	if c.next_flush_at_ms == 0 && c.flush_interval_ms >= 0 {
 		c.next_flush_at_ms = now_ms + c.flush_interval_ms
@@ -524,7 +553,8 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			c.last_failure = .Rate_Limited
 			sig.flush_failed = true
 			sig.reason = "rate_limited"
-		case res.status == 400:
+		case res.status == 400 || res.status == 413:
+			// 413 is the same answer as 400: too big, so split; never resent as is.
 			if n > 1 {
 				// Batch rejected as oversize: halve and retry immediately.
 				c.batch_limit = max(1, n / 2)

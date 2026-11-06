@@ -711,3 +711,70 @@ test_stale_session_answer_is_ignored :: proc(t: ^testing.T) {
 	testing.expect(t, ok)
 	testing.expect_value(t, req2.kind, Request_Kind.Session)
 }
+
+@(test)
+test_413_splits_like_400_and_is_never_resent_as_is :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	track_n(&c, 4, T0)
+	open_session(t, &c, T0)
+	core_request_flush(&c)
+
+	sizes := [?]int{4, 2, 1}
+	for size in sizes {
+		sig := step_batch(t, &c, T0, size, Core_Response{status = 413})
+		testing.expect_value(t, c.next_attempt_at_ms, i64(0))
+		testing.expect_value(t, sig.event_dropped, size == 1)
+	}
+	testing.expect_value(t, len(c.queue), 3)
+	testing.expect_value(t, c.queue[0].name, "e1")
+	testing.expect_value(t, c.stats.dropped, 1)
+}
+
+@(test)
+test_gameplay_events_stay_ahead_of_errors :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	boot(t, &c, T0, with_session = false)
+	core_track(&c, "g0", "", T0)
+	core_track(&c, "err0", "", T0, is_error = true)
+	core_track(&c, "err1", "", T0, is_error = true)
+	core_track(&c, "g1", "", T0)
+	names := [?]string{"g0", "g1", "err0", "err1"}
+	testing.expect_value(t, len(c.queue), 4)
+	for n, i in names {
+		testing.expect_value(t, c.queue[i].name, n)
+	}
+
+	// A batch in flight is never reordered: a new gameplay event goes in
+	// front of the errors queued after it, not into it.
+	open_session(t, &c, T0)
+	core_request_flush(&c)
+	req, ok := core_next(&c, T0)
+	testing.expect(t, ok)
+	delete(req.body)
+	testing.expect_value(t, req.batch_len, 4)
+	core_track(&c, "err2", "", T0, is_error = true)
+	core_track(&c, "g2", "", T0)
+	testing.expect_value(t, c.queue[4].name, "g2")
+	testing.expect_value(t, c.queue[5].name, "err2")
+	sig := core_on_response(&c, Core_Response{status = 202}, T0)
+	testing.expect_value(t, sig.events_flushed, 4)
+	testing.expect_value(t, c.queue[0].name, "g2")
+}
+
+@(test)
+test_full_queue_drops_the_oldest_error_first :: proc(t: ^testing.T) {
+	c := core_make(max_queue = 3)
+	defer core_destroy(&c)
+	core_track(&c, "g0", "", T0)
+	core_track(&c, "err0", "", T0, is_error = true)
+	core_track(&c, "g1", "", T0)
+	core_track(&c, "g2", "", T0)
+	testing.expect_value(t, len(c.queue), 3)
+	testing.expect_value(t, c.queue[0].name, "g0")
+	testing.expect_value(t, c.queue[1].name, "g1")
+	testing.expect_value(t, c.queue[2].name, "g2")
+	testing.expect_value(t, c.stats.dropped, 1)
+}
