@@ -137,6 +137,14 @@ Config :: struct {
 	// Opt in to the once-a-second frame sampling behind the single `health`
 	// event sent from shutdown(). Default false.
 	performance:              bool,
+	// The device fields sent on the session, as your engine reports them
+	// without a permission prompt and never a hardware identifier: the
+	// device model, the OS version (no OS name) and the GPU name. The SDK
+	// probes nothing itself. Empty fields are left out; each is cut to 128
+	// printable characters.
+	device_model:             string,
+	device_os_version:        string,
+	device_gpu:               string,
 	callbacks:                Callbacks,
 }
 
@@ -230,6 +238,11 @@ Client :: struct {
 	health_sent:        bool,
 	boot_ms:            i64, // process start to create(), ms
 	capture:            Capture_Client, // automatic error capture (errors.odin)
+	device_json:        string, // owned; the session's device object, "" when none
+	signing_secret:     string, // owned; the session's signing secret, memory only
+	clock_offset_s:     i64,    // serverTime minus the device clock at the session answer
+	queue_loaded:       bool,   // the saved queue was read
+	exposed:            map[string]bool, // experiments this session used
 }
 
 @(private)
@@ -276,6 +289,8 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	cl.platform = strings.clone(len(config.platform) > 0 ? config.platform : default_platform())
 	cl.request_timeout_ms = config.request_timeout_ms > 0 ? config.request_timeout_ms : DEFAULT_REQUEST_TIMEOUT_MS
 	cl.lifecycle = !config.disable_lifecycle_events
+	cl.device_json = strings.clone(device_json(config.device_model, config.device_os_version, config.device_gpu))
+	cl.exposed = make(map[string]bool)
 	cl.side = make([dynamic]^Transfer)
 	cl.pending_feedback = make([dynamic]Pending_Feedback)
 
@@ -357,6 +372,9 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	}
 
 	load_config_cache(cl)
+	if len(cl.playtest.token) == 0 && !cl.core.opted_out {
+		load_queue(cl)
+	}
 	maybe_queue_game_started(cl)
 	capture_init(cl)
 	capture_load_crash(cl)
@@ -506,7 +524,7 @@ track_event :: proc(client: ^Client, name: string, data: any, is_error: bool, ta
 	}
 	data_json = with_config_exposures(client, data_json)
 	data_json = with_event_id(client, data_json)
-	if len(data_json) > MAX_EVENT_BYTES {
+	if event_bytes(data_json) > MAX_EVENT_BYTES {
 		client.core.stats.dropped += 1
 		if !client.warned_too_large {
 			client.warned_too_large = true
@@ -587,9 +605,13 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled, opted_in = client.saved_opt_in}) {
 		log(client, .Warning, "Ravensight: could not save the analytics choice to the storage file.")
 	}
-	if !enabled { clear_config(client, true) }
+	if !enabled {
+		clear_config(client, true)
+		forget_queue(client)
+	}
 	core_set_opted_out(&client.core, !enabled)
 	if enabled {
+		load_queue(client)
 		load_config_cache(client)
 		if core_is_session_valid(&client.core, client_now(client)) { fetch_config(client) }
 		maybe_queue_game_started(client)
@@ -625,6 +647,12 @@ reset_device_id :: proc(client: ^Client) -> string {
 		return client.device_id
 	}
 	clear_config(client, true)
+	// A new identity is a new install for attribution and a new session.
+	forget_queue(client)
+	if flag := attribution_flag_path(client); len(flag) > 0 && os.exists(flag) {
+		os.remove(flag)
+	}
+	clear_exposed(client)
 	if client.consent == .Opt_In && client.core.opted_out {
 		// Not opted in: forget any saved id and make none until the yes.
 		if len(client.storage_path) > 0 && os.exists(client.storage_path) {
@@ -850,7 +878,18 @@ tick :: proc(client: ^Client, dt: f64 = 0) {
 tick_protocol :: proc(client: ^Client) {
 	pump(client)
 	start_next_protocol_request(client)
+	persist_queue(client)
 	sync_reason(client)
+}
+
+// Deletes the saved queue (the player's opt-out, a reset identity). The
+// queue is read again, empty, when collecting starts.
+@(private)
+forget_queue :: proc(client: ^Client) {
+	if path := queue_path(client); len(path) > 0 && os.exists(path) {
+		os.remove(path)
+	}
+	client.queue_loaded = false
 }
 
 // The quit path: queues game_exited (once), makes one best-effort flush that
@@ -890,6 +929,8 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		}
 	}
 
+	// Whatever was not delivered goes out on the next launch.
+	persist_queue(client)
 	if client.protocol != nil {
 		free_transfer(client, client.protocol)
 		client.protocol = nil
@@ -924,6 +965,10 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	delete(client.playtest.run_id)
 	delete(client.playtest.job_id)
 	delete(client.playtest.persona)
+	delete(client.device_json)
+	clear_signing(client)
+	clear_exposed(client)
+	delete(client.exposed)
 	free(client)
 }
 
@@ -1215,11 +1260,30 @@ start_next_protocol_request :: proc(client: ^Client) {
 			strings.write_string(&b, `,"distribution":`)
 			write_json_string(&b, client.distribution)
 		}
+		if len(client.device_json) > 0 {
+			strings.write_string(&b, `,"device":`)
+			strings.write_string(&b, client.device_json)
+		}
 		strings.write_string(&b, `,"sdk":"odin/` + VERSION + `"`)
 		strings.write_byte(&b, '}')
 		t = start_request(client, "/session", strings.to_string(b), .API_Key)
 	case .Batch:
-		t = start_request(client, "/track/batch", req.body, .Session_Token)
+		// Signed over the uncompressed body; compressed from GZIP_MIN_BYTES.
+		extra := make([dynamic]string, context.temp_allocator)
+		if len(client.signing_secret) > 0 {
+			ts := client_now(client) / 1000 + client.clock_offset_s
+			append(&extra, fmt.tprintf("X-Ravensight-Timestamp: %d", ts))
+			append(&extra, fmt.tprintf("X-Ravensight-Signature: v1=%s", sign_body(client.signing_secret, ts, req.body)))
+		}
+		body := req.body
+		if len(body) >= GZIP_MIN_BYTES && !client.core.send_plain {
+			if compressed, ok := gzip_compress(body, context.temp_allocator); ok {
+				body = compressed
+				append(&extra, "Content-Encoding: gzip")
+			}
+		}
+		client.core.last_batch_compressed = len(body) != len(req.body) || body != req.body
+		t = start_request(client, "/track/batch", body, .Session_Token, extra[:])
 		delete(req.body)
 	case .None:
 	}
@@ -1320,7 +1384,11 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 	res := Core_Response{
 		status         = status,
 		retry_after_ms = retry_after_ms,
+		index          = -1,
 	}
+	// What this run queued is on disk before an answer can stop the core
+	// (a refused key keeps the queue for the next launch).
+	persist_queue(client)
 
 	parsed, ok := parse_body(t.body_buf[:])
 	defer if ok {json.destroy_value(parsed)}
@@ -1362,21 +1430,32 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 				res.expires_in_ms = json_number_i64(v) * 1000
 			}
 		}
-	case .Batch, .None:
+	case .Batch:
+		if is_obj && status == 400 {
+			#partial switch v in obj["index"] {
+			case json.Integer:
+				res.index = int(v)
+			case json.Float:
+				res.index = int(v)
+			}
+		}
+		if status == 401 {
+			clear_signing(client)
+		}
+	case .None:
 	}
 
-	// The events this answer settles for good: accepted, or a single event
-	// the server will never take. Copied before the core frees them.
-	settled: []Core_Event
-	if t.kind == .Batch && client.core.in_flight_queue_gen == client.core.queue_gen {
-		n := min(client.core.in_flight_batch, len(client.core.queue))
-		if status == 202 || ((status == 400 || status == 413) && n == 1) {
-			settled = make([]Core_Event, n, context.temp_allocator)
-			copy(settled, client.core.queue[:n])
-		}
-	}
 	sig := core_on_response(&client.core, res, client_now(client))
-	capture_events_settled(client, settled)
+	// Crash records whose events this answer settled for good (delivered or
+	// refused) are removed from disk.
+	for tag in client.core.settled_tags {
+		capture_forget_crash(client, tag)
+	}
+	clear(&client.core.settled_tags)
+	if t.kind == .Session && sig.session_ready && is_obj {
+		adopt_session_extras(client, obj)
+	}
+	persist_queue(client)
 	dispatch(client, sig)
 	if ec_answer {
 		capture_answer(client, ec_present, ec_enabled, ec_trail)
@@ -1527,4 +1606,13 @@ json_number_i64 :: proc(v: json.Value) -> i64 {
 		return i64(n)
 	}
 	return 0
+}
+
+// Forgets which experiments this session used (the keys are owned).
+@(private)
+clear_exposed :: proc(client: ^Client) {
+	for key in client.exposed {
+		delete(key, client.allocator)
+	}
+	clear(&client.exposed)
 }

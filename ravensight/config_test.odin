@@ -23,13 +23,16 @@ test_config_fetch_etag_and_event_snapshot :: proc(t:^testing.T) {
  testing.expect_value(t,get_config_string(cl,"label"),"easy")
  copy:=get_config_json(cl,"nested"); defer delete(copy)
  testing.expect(t,strings.contains(copy,"[1,2]"))
- testing.expect(t,!strings.contains(cl.core.queue[len(cl.core.queue)-1].data_json,"rs_exp_"))
+ for e in cl.core.queue { if e.name=="before" { testing.expect(t,!strings.contains(e.data_json,"rs_exp_")) } }
+ testing.expect_value(t,cl.core.queue[len(cl.core.queue)-1].name,"rs_exposure")
+ testing.expect(t,strings.contains(cl.core.queue[len(cl.core.queue)-1].data_json,`"rs_exp_tutorial":"short"`))
  props:=make(map[string]string,context.temp_allocator)
- props["rs_exp_tutorial"]="forged"; props["rs_exp_fake"]="x"
+ props["rs_exp_tutorial"]="forged"
  track(cl,"after",props)
- data:=cl.core.queue[len(cl.core.queue)-1].data_json
- testing.expect(t,strings.contains(data,`"rs_exp_tutorial":"short"`))
- testing.expect(t,!strings.contains(data,"rs_exp_fake"))
+ testing.expect(t,strings.contains(cl.core.queue[len(cl.core.queue)-1].data_json,`"rs_exp_tutorial":"forged"`))
+ props["rs_exp_tutorial"]="Not Valid!"
+ track(cl,"after2",props)
+ testing.expect(t,strings.contains(cl.core.queue[len(cl.core.queue)-1].data_json,`"rs_exp_tutorial":"short"`))
  fetch_config(cl); idx=open_request(&f)
  testing.expect(t,has_header(f.requests[idx],`If-None-Match: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`))
  answer(&f,idx,304)

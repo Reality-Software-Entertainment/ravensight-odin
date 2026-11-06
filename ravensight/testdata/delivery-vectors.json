@@ -1,0 +1,169 @@
+{
+  "description": "Test vectors for docs/sdk/DELIVERY_CONTRACT.md. The server tests read this file (requestSigning, ingestBody and eventOrigin tests); every SDK checks its client against it. Error event rules are in docs/errors/CONTRACT.md.",
+  "signing": {
+    "secret": "dGVzdC1zZWNyZXQtZm9yLWRlbGl2ZXJ5LWNvbnRyYWN0",
+    "algorithm": "HMAC-SHA256 over the UTF-8 bytes of canonical, keyed with the UTF-8 bytes of secret, as 64 lowercase hex",
+    "header": [
+      {
+        "name": "batch",
+        "timestamp": 1767225600,
+        "body": "{\"events\":[{\"event\":\"pickup\",\"timestamp\":1767225590123,\"data\":{\"rs_event_id\":\"a1b2c3d4e5f6a7b8-0001\"}}]}",
+        "canonical": "v1:1767225600:{\"events\":[{\"event\":\"pickup\",\"timestamp\":1767225590123,\"data\":{\"rs_event_id\":\"a1b2c3d4e5f6a7b8-0001\"}}]}",
+        "header": "v1=1a08dbdfe81eac30363314d0a0b2cf79389c96c539fc56a4a1edaaa3f51146f6"
+      },
+      {
+        "name": "single",
+        "timestamp": 1767225600,
+        "body": "{\"event\":\"game_started\"}",
+        "canonical": "v1:1767225600:{\"event\":\"game_started\"}",
+        "header": "v1=03331575ba8750faafc921588376ae6489dc6b799737ed1aa52e15a289ce2ddd"
+      },
+      {
+        "name": "empty body",
+        "timestamp": 1767225600,
+        "body": "",
+        "canonical": "v1:1767225600:",
+        "header": "v1=a99ea76fc1e223dc0b5c81696000e33eff661ccad01cc0e8f42781d3a000a7a4"
+      },
+      {
+        "name": "non-ASCII, signed as UTF-8 bytes",
+        "timestamp": 1767225601,
+        "body": "{\"events\":[{\"event\":\"café\",\"data\":{\"note\":\"über ☃\"}}]}",
+        "canonical": "v1:1767225601:{\"events\":[{\"event\":\"café\",\"data\":{\"note\":\"über ☃\"}}]}",
+        "header": "v1=50c51eff7578c945aeb8cc57fd2ff6431443a38102d3bbee67da106bac8b163a"
+      }
+    ],
+    "beacon": [
+      {
+        "name": "beacon batch",
+        "t": 1767225600,
+        "inner": "{\"events\":[{\"event\":\"game_exited\",\"timestamp\":1767225599000,\"data\":{\"rs_event_id\":\"a1b2c3d4e5f6a7b8-0002\"}}]}",
+        "envelope": {
+          "sessionToken": "SESSION_TOKEN",
+          "signed": {
+            "v": 1,
+            "t": 1767225600,
+            "body": "{\"events\":[{\"event\":\"game_exited\",\"timestamp\":1767225599000,\"data\":{\"rs_event_id\":\"a1b2c3d4e5f6a7b8-0002\"}}]}",
+            "sig": "dedeb1fd59529ea9b54a14401d8f4ef13bacb6325b68bb8a2e916f30ff4c6e65"
+          }
+        }
+      }
+    ]
+  },
+  "anyKeyEventSize": {
+    "note": "The 8 KB ceiling on one event's data that every key has (DELIVERY_CONTRACT section 6). {repeat, count} is the string repeat repeated count times. expect is the 400 error code, or null when accepted.",
+    "cases": [
+      {
+        "name": "error event: 2,000 control characters of stack and 200 of message fit, though they serialize to over 13 KB",
+        "data": {
+          "rs_kind": "error",
+          "rs_severity": "error",
+          "rs_message": {
+            "repeat": "\u0001",
+            "count": 200
+          },
+          "rs_stack": {
+            "repeat": "\u0001",
+            "count": 2000
+          }
+        },
+        "expect": null
+      },
+      {
+        "name": "error event: 2,000 characters of four-byte text fit",
+        "data": {
+          "rs_kind": "error",
+          "rs_severity": "error",
+          "rs_message": "boom",
+          "rs_stack": {
+            "repeat": "😀",
+            "count": 1000
+          }
+        },
+        "expect": null
+      },
+      {
+        "name": "the same control characters on an event that is not a typed error are over 8 KB",
+        "data": {
+          "rs_stack": {
+            "repeat": "\u0001",
+            "count": 2000
+          }
+        },
+        "expect": "event_too_large"
+      },
+      {
+        "name": "error event: the rest of the data still counts in full",
+        "data": {
+          "rs_kind": "error",
+          "rs_severity": "error",
+          "rs_message": "boom",
+          "rs_stack": {
+            "repeat": "s",
+            "count": 2000
+          },
+          "context": {
+            "repeat": "\u0001",
+            "count": 1100
+          }
+        },
+        "expect": "event_too_large"
+      },
+      {
+        "name": "error event: a stack past 2,000 characters is counted in bytes",
+        "data": {
+          "rs_kind": "error",
+          "rs_severity": "error",
+          "rs_message": "boom",
+          "rs_stack": {
+            "repeat": "\u0001",
+            "count": 2001
+          }
+        },
+        "expect": "event_too_large"
+      },
+      {
+        "name": "error event: 1,500 control characters of trail fit too",
+        "data": {
+          "rs_kind": "error",
+          "rs_severity": "error",
+          "rs_message": "boom",
+          "rs_stack": {
+            "repeat": "\u0001",
+            "count": 2000
+          },
+          "rs_trail": {
+            "repeat": "\u0001",
+            "count": 1500
+          }
+        },
+        "expect": null
+      }
+    ]
+  },
+  "originStampAge": {
+    "note": "How old an origin stamp may be when its event arrives. A stamp is opaque to an SDK (it is keyed with a server secret), so these are checked by the server tests only; they tell an SDK what it may rely on.",
+    "cases": [
+      {
+        "name": "an 89 day old event recorded a day into its session: stamp 90 days old",
+        "stampAgeSeconds": 7776000,
+        "expect": "replayed"
+      },
+      {
+        "name": "the last second of the 91 day allowance",
+        "stampAgeSeconds": 7862400,
+        "expect": "replayed"
+      },
+      {
+        "name": "one second past 91 days",
+        "stampAgeSeconds": 7862401,
+        "expect": "refused"
+      },
+      {
+        "name": "issued more than a minute in the server future",
+        "stampAgeSeconds": -61,
+        "expect": "refused"
+      }
+    ]
+  }
+}

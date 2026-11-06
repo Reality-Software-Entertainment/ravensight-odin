@@ -128,9 +128,9 @@ test_repeated_401_backs_off :: proc(t: ^testing.T) {
 	open_session(t, &c, T0)
 	core_request_flush(&c)
 
-	// Three consecutive 401s on freshly issued tokens: the third one must
-	// stop the hot re-auth loop.
-	for _ in 0 ..< 2 {
+	// Two consecutive 401s: the first opens a new session once, the second
+	// stops the re-auth loop and waits for the backoff.
+	for _ in 0 ..< 1 {
 		step_batch(t, &c, T0, 10, Core_Response{status = 401})
 		open_session(t, &c, T0)
 	}
@@ -220,10 +220,11 @@ test_400_splits_batch_down_to_one_then_drops :: proc(t: ^testing.T) {
 	open_session(t, &c, T0)
 	core_request_flush(&c)
 
-	// 50 -> 25 -> 12 -> 6 -> 3 -> 1, all rejected with 400, no backoff.
+	// 50 -> 25 -> 12 -> 6 -> 3 -> 1, all rejected with a 400 about one
+	// event that names no index, no backoff.
 	sizes := [?]int{50, 25, 12, 6, 3, 1}
 	for size in sizes {
-		sig := step_batch(t, &c, T0, size, Core_Response{status = 400})
+		sig := step_batch(t, &c, T0, size, Core_Response{status = 400, error_code = "event_too_large", index = -1})
 		testing.expect_value(t, c.next_attempt_at_ms, i64(0))
 		if size == 1 {
 			testing.expect(t, sig.event_dropped)

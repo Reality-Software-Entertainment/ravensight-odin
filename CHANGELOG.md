@@ -5,6 +5,32 @@ may break the API.
 
 ## [Unreleased]
 
+Held until the Ravensight server release that accepts origins, signatures,
+gzip bodies and the ad and attribution keys is deployed. The version is set
+at release.
+
+### Breaking
+
+- Experiment tags follow the exposure contract: `rs_exp_<key>` only after the session's first typed config read, with one `rs_exposure` event; a well-formed tag the game sets is kept.
+- A refused key or the kill switch keeps the queued events on disk for the next launch.
+- A batch 401 opens a new session once (was twice), then backs off. Backoff waits are multiplied by a random factor from 0.5 up to 1 (was plus or minus 20 percent).
+- A 400 that is not about one event drops that request's events instead of halving.
+
+### Added
+
+- Saved queue beside the storage file, `queue-<hash>.json`, format version 2, written atomically whenever it changes, at most 500 events, 89 days, read by `create()`; deleted on opt-out and `reset_device_id`.
+- The saved queue keeps 0.5.0's rules (errors evicted first and queued behind gameplay, a 413 split like a 400). Crash events that have their own crash record are not written to it, so they are never sent twice, and the crash records an answer settles are removed for every settling answer (any 2xx, an indexed 400, a dropped request), not only a 202.
+- Each session's `origin` is saved with its events and sent on every event a later session delivers.
+- gzip for request bodies of 1,024 bytes or more on macOS and Linux (system zlib); a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as in 0.5.0).
+- Request signing with `core:crypto/hmac` when the session answer has `signing`, with the clock corrected by `serverTime`.
+- A 400 with `index` drops only that event; `batch_too_large` and 413 halve; `flush(client, true)` never cuts a Retry-After wait.
+- `track_ad`, `track_ad_revenue`, `micros_from_decimal_string`, `micros_from_revenue`, `set_attribution` (once per install); `stats()` counts `dropped_overflow`, `dropped_too_old` and `dropped_refused`.
+- `Config.device_model`, `device_os_version` and `device_gpu`, sent on the session.
+
+### Fixed
+
+- The 8 KB check measures as the server does: a character outside the Basic Multilingual Plane counts its 4 UTF-8 bytes (Odin's JSON writer escapes it as 12), and an error event's `rs_message`, `rs_stack` and `rs_trail` count one byte a character within their caps.
+
 ### Changed
 
 - Event timestamps are unix milliseconds, so events in one second keep their
