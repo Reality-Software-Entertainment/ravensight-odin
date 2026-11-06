@@ -1,0 +1,96 @@
+{
+  "about": "Shared scrub cases from docs/errors/CONTRACT.md. The server (src/services/errorScrub.js) and every SDK copy this file into their tests and must produce `out` for each `in`. Change the contract and this file together.",
+  "version": 2,
+  "cases": [
+    {
+      "name": "email",
+      "in": "contact jane.doe@example.com now",
+      "out": "contact [email] now"
+    },
+    {
+      "name": "bearer",
+      "in": "Authorization: Bearer abc.DEF-ghi_123",
+      "out": "Authorization: [token]"
+    },
+    {
+      "name": "ravensight key",
+      "in": "key gt_live_abcdef12 refused",
+      "out": "key [token] refused"
+    },
+    {
+      "name": "jwt",
+      "in": "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl end",
+      "out": "jwt [token] end"
+    },
+    {
+      "name": "long hex with digits",
+      "in": "hash 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "out": "hash [token]"
+    },
+    {
+      "name": "long name without digits stays",
+      "in": "at very_long_function_name_without_any_digits_at_all (main.gd:3)",
+      "out": "at very_long_function_name_without_any_digits_at_all (main.gd:3)"
+    },
+    {
+      "name": "path with a digit stays",
+      "in": "at _on_hit (res://addons/inventory_system2/ui/inventory_slot.gd:42)",
+      "out": "at _on_hit (res://addons/inventory_system2/ui/inventory_slot.gd:42)"
+    },
+    {
+      "name": "deep path with a digit stays",
+      "in": "Assets/Scripts/Inventory2/Slots/InventorySlotController.cs:88",
+      "out": "Assets/Scripts/Inventory2/Slots/InventorySlotController.cs:88"
+    },
+    {
+      "name": "ipv4",
+      "in": "connect to 192.168.1.20 failed",
+      "out": "connect to [ip] failed"
+    },
+    {
+      "name": "mac home",
+      "in": "/Users/jacob/Projects/game/main.gd:10",
+      "out": "~/Projects/game/main.gd:10"
+    },
+    {
+      "name": "linux home",
+      "in": "/home/sam/game.x86_64",
+      "out": "~/game.x86_64"
+    },
+    {
+      "name": "windows home",
+      "in": "C:\\Users\\jacob\\game\\main.cs",
+      "out": "~\\game\\main.cs"
+    },
+    {
+      "name": "url query and fragment",
+      "in": "GET https://api.example.com/v1/kick?token=abc#x",
+      "out": "GET https://api.example.com/v1/kick"
+    },
+    {
+      "name": "plain text untouched",
+      "in": "Kick Off failed: season not started",
+      "out": "Kick Off failed: season not started"
+    },
+    {
+      "name": "dead click untouched",
+      "in": "Dead click: button Kick Off",
+      "out": "Dead click: button Kick Off"
+    },
+    {
+      "name": "version numbers are not an ip",
+      "in": "Godot 4.5.1 build",
+      "out": "Godot 4.5.1 build"
+    },
+    {
+      "name": "secret with slashes",
+      "in": "aws wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY1 leaked",
+      "out": "aws [token] leaked"
+    },
+    {
+      "name": "base64 with slash and padding",
+      "in": "blob QmFzZTY0/ZW5jb2RlZA2ZGF0YQ8+cGFkZGluZ3Rlc3Q= end",
+      "out": "blob [token] end"
+    }
+  ]
+}
