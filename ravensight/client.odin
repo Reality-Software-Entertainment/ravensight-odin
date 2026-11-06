@@ -229,6 +229,7 @@ Client :: struct {
 	health_last_tick_ms:   i64,
 	health_sent:        bool,
 	boot_ms:            i64, // process start to create(), ms
+	capture:            Capture_Client, // automatic error capture (errors.odin)
 }
 
 @(private)
@@ -238,11 +239,11 @@ curl_global_ready := false
 // Reads the saved device id and the player's opt-out synchronously, and
 // queues game_started with this moment's timestamp when tracking is on.
 create :: proc(config: Config, allocator := context.allocator) -> (client: ^Client, err: Error) {
-	return create_with_transport(config, Transport{}, true, allocator)
+	return create_with_transport(config, Transport{}, true, allocator, bind_capture = true)
 }
 
 @(private)
-create_with_transport :: proc(config: Config, transport: Transport, read_process: bool, allocator := context.allocator) -> (client: ^Client, err: Error) {
+create_with_transport :: proc(config: Config, transport: Transport, read_process: bool, allocator := context.allocator, bind_capture := false) -> (client: ^Client, err: Error) {
 	if len(strings.trim_space(config.ingest_key)) == 0 {
 		return create_inert(config, transport, allocator), .None
 	}
@@ -357,6 +358,11 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 
 	load_config_cache(cl)
 	maybe_queue_game_started(cl)
+	capture_init(cl)
+	capture_load_crash(cl)
+	if bind_capture {
+		capture_bind(cl)
+	}
 	cl.last_reason = core_reason(&cl.core)
 	return cl, .None
 }
@@ -470,6 +476,12 @@ with_event_id :: proc(client: ^Client, data_json: string) -> string {
 // `data` cannot be serialized, or its JSON is over MAX_EVENT_BYTES (dropped,
 // on_flush_failed "event_too_large", one warning for the run).
 track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
+	return track_event(client, name, data, false)
+}
+
+// track with the error flag: error events queue behind gameplay events.
+@(private)
+track_event :: proc(client: ^Client, name: string, data: any, is_error: bool) -> bool {
 	if client == nil {
 		return false
 	}
@@ -501,11 +513,13 @@ track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
 			log(client, .Warning, fmt.tprintf("Ravensight: dropped event \"%s\": larger than %d bytes as JSON (further drops are not logged).", name, MAX_EVENT_BYTES))
 		}
 		if client.cb.on_flush_failed != nil {
+			capture_quiet += 1
 			client.cb.on_flush_failed(client.cb.user, "event_too_large")
+			capture_quiet -= 1
 		}
 		return false
 	}
-	return core_track(&client.core, name, data_json, client_now(client))
+	return core_track(&client.core, name, data_json, client_now(client), is_error)
 }
 
 // Asks for queued events to be sent on the next tick(), without waiting for
@@ -620,6 +634,7 @@ reset_device_id :: proc(client: ^Client) -> string {
 		client.saved_device_id = strings.clone("")
 		client.device_id = strings.clone("")
 		client.saved_opt_in = false
+		capture_reset(client)
 		core_discard_queue(&client.core)
 		core_invalidate_session(&client.core)
 		drop_pending_feedback(client, "device_id_reset")
@@ -634,6 +649,7 @@ reset_device_id :: proc(client: ^Client) -> string {
 	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out, opted_in = client.saved_opt_in}) {
 		log(client, .Warning, "Ravensight: could not save the new device id to the storage file.")
 	}
+	capture_reset(client)
 	core_discard_queue(&client.core)
 	core_invalidate_session(&client.core)
 	drop_pending_feedback(client, "device_id_reset")
@@ -819,9 +835,13 @@ tick :: proc(client: ^Client, dt: f64 = 0) {
 		return
 	}
 	context.allocator = client.allocator
+	// Nothing logged while the SDK runs, its callbacks included, is captured.
+	capture_quiet += 1
+	defer capture_quiet -= 1
 	if client.performance && !client.health_sent {
 		sample_frame(client, dt)
 	}
+	capture_drain(client)
 	tick_protocol(client)
 }
 
@@ -840,7 +860,10 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 		return
 	}
 	context.allocator = client.allocator
+	capture_quiet += 1
+	defer capture_quiet -= 1
 
+	capture_drain(client)
 	send_health(client)
 	if client.lifecycle && !client.exited_queued && core_is_active(&client.core) {
 		client.exited_queued = true
@@ -885,6 +908,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	}
 
 	clear_config(client, false)
+	capture_destroy(client)
 	core_destroy(&client.core)
 	delete(client.api_url)
 	delete(client.ingest_key)
@@ -932,6 +956,8 @@ default_platform :: proc() -> string {
 
 @(private)
 log :: proc(client: ^Client, level: Log_Level, message: string) {
+	capture_quiet += 1
+	defer capture_quiet -= 1
 	if client.cb.on_log != nil {
 		client.cb.on_log(client.cb.user, level, message)
 	} else if level == .Warning {
@@ -941,6 +967,8 @@ log :: proc(client: ^Client, level: Log_Level, message: string) {
 
 @(private)
 fail_feedback :: proc(client: ^Client, reason: string) {
+	capture_quiet += 1
+	defer capture_quiet -= 1
 	if client.cb.on_feedback_failed != nil {
 		client.cb.on_feedback_failed(client.cb.user, reason)
 	}
@@ -959,6 +987,7 @@ maybe_queue_game_started :: proc(client: ^Client) {
 
 @(private)
 sync_reason :: proc(client: ^Client) {
+	capture_sync(client)
 	r := core_reason(&client.core)
 	if r == client.last_reason {
 		return
@@ -1302,6 +1331,12 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 		res.error_code = fmt.bprintf(fallback_buf[:], "http_%d", status)
 	}
 
+	ec_present, ec_enabled, ec_trail: bool
+	ec_answer := is_obj && ((t.kind == .Settings && status == 200) || (t.kind == .Session && status == 201))
+	if ec_answer {
+		ec_present, ec_enabled, ec_trail = parse_error_capture(obj)
+	}
+
 	switch t.kind {
 	case .Settings:
 		if is_obj {
@@ -1331,6 +1366,9 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 
 	sig := core_on_response(&client.core, res, client_now(client))
 	dispatch(client, sig)
+	if ec_answer {
+		capture_answer(client, ec_present, ec_enabled, ec_trail)
+	}
 }
 
 @(private)

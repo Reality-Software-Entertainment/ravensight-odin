@@ -52,7 +52,7 @@ Extra :: map[string]json.Value
 
 // Caller keys first, then the reserved keys written over them.
 @(private)
-typed_track :: proc(client: ^Client, name: string, props: map[string]json.Value, extra: Extra) -> bool {
+typed_track :: proc(client: ^Client, name: string, props: map[string]json.Value, extra: Extra, is_error := false) -> bool {
 	merged := make(map[string]json.Value, allocator = context.temp_allocator)
 	for k, v in extra {
 		merged[k] = v
@@ -60,7 +60,7 @@ typed_track :: proc(client: ^Client, name: string, props: map[string]json.Value,
 	for k, v in props {
 		merged[k] = v
 	}
-	return track(client, name, merged)
+	return track_event(client, name, merged, is_error)
 }
 
 // Cuts to at most `max` code points without allocating.
@@ -191,7 +191,7 @@ track_error :: proc(
 	if len(stack) > 0 {
 		props["rs_stack"] = json.String(cut_runes(stack, MAX_ERROR_STACK_CHARS))
 	}
-	return typed_track(client, len(name) > 0 ? name : "error", props, extra)
+	return typed_track(client, len(name) > 0 ? name : "error", props, extra, is_error = true)
 }
 
 // --- Health sampling -------------------------------------------------------------
