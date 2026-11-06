@@ -431,9 +431,15 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 		return false
 	}
 
-	// Events in the batch in flight are never moved or dropped here.
+	// Events in the batch in flight are never moved or dropped here: with
+	// nothing outside it to make room, the incoming event is dropped.
 	floor := c.in_flight == .Batch ? min(c.in_flight_batch, len(c.queue)) : 0
 	for len(c.queue) >= core_queue_cap(c) {
+		if floor >= len(c.queue) {
+			c.stats.dropped += 1
+			c.stats.dropped_overflow += 1
+			return false
+		}
 		victim := 0
 		for i in floor ..< len(c.queue) {
 			if c.queue[i].is_error {

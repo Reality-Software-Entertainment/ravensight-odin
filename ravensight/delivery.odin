@@ -63,6 +63,10 @@ write_atomic :: proc(path: string, text: string) -> bool {
 	if os.write_entire_file(tmp, transmute([]u8)text) != nil {
 		return false
 	}
+	// The queue holds origin stamps and scrubbed captures: keep it out of
+	// backups where the system has a way to say so. Set on the new file, so
+	// the rename carries it over.
+	exclude_from_backup(tmp)
 	if os.rename(tmp, path) != nil {
 		os.remove(tmp)
 		return false

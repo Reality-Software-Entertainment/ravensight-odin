@@ -451,6 +451,12 @@ Rotate it from the dashboard at any time.
   crash with its own crash record is not written at all. A game that is
   killed sends what it had queued on the next launch. A playtest run keeps
   its queue in memory only.
+* **Device backups.** The file holds origin stamps and scrubbed error
+  captures, so it stays out of backups. On macOS the SDK marks it excluded
+  from Time Machine itself (the attribute `tmutil addexclusion` writes).
+  Windows and Linux have no common way to say it, so nothing is done
+  there. An iOS build should also set `NSURLIsExcludedFromBackupKey` on
+  the folder holding the storage file from the app's native code.
 * **Removed only when delivered.** An event leaves the file only after a 2xx
   answer, or a 400 that refuses it.
 * **Origin.** Each session's events are saved with the session answer's
