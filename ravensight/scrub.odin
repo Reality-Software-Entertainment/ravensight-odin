@@ -9,8 +9,9 @@
 //   2. "Bearer <token>", a JWT-shaped string (eyJ... dot ... dot ...) and a
 //      gt_ key become [token].
 //   3. An email address becomes [email].
-//   4. C:\Users\<name> (either slash, any drive letter), /Users/<name> and
-//      /home/<name> become ~.
+//   4. C:\Users\<name> and C:\Documents and Settings\<name> (either slash,
+//      any drive letter), /Users/<name> and /home/<name> become ~, the
+//      whole name, spaces included.
 //   5. An IPv4 address becomes [ip]; so does an IPv6 address written in
 //      full (eight groups) or compressed with ::. An IPv6 match must have a
 //      digit, so `Face::Add` is left alone.
@@ -322,28 +323,39 @@ match_email :: proc(s: string, i: int) -> (int, string, bool, int) {
 }
 
 @(private)
-is_path_name_byte :: proc(c: u8, backslash_too: bool) -> bool {
-	if c == '/' || is_space_byte(c) || c == '\'' || c == '"' {
+// A home folder is the whole segment up to the next slash, quote, <, >, ':'
+// or end of line, spaces included (contract 5): a name can be `Jo Ann`.
+is_path_name_byte :: proc(c: u8) -> bool {
+	switch c {
+	case '/', '\\', '\'', '"', '<', '>', ':', '\r', '\n':
 		return false
 	}
-	return !(backslash_too && c == '\\')
+	return true
 }
 
-// 4a. C:\Users\<name> or C:/Users/<name>
+// 4a. C:\Users\<name> or C:\Documents and Settings\<name>, either slash
 @(private)
 match_home_windows :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_alpha_byte(s[i]) || !boundary_before(s, i) || i + 9 >= len(s) {
 		return 0, "", false, 0
 	}
-	if s[i + 1] != ':' || (s[i + 2] != '\\' && s[i + 2] != '/') || !match_fold(s, i + 3, "users") {
+	if s[i + 1] != ':' || (s[i + 2] != '\\' && s[i + 2] != '/') {
 		return 0, "", false, 0
 	}
-	if s[i + 8] != '\\' && s[i + 8] != '/' {
+	j: int
+	if match_fold(s, i + 3, "users") {
+		j = i + 3 + len("users")
+	} else if match_fold(s, i + 3, "documents and settings") {
+		j = i + 3 + len("documents and settings")
+	} else {
 		return 0, "", false, 0
 	}
-	j := i + 9
+	if j >= len(s) || (s[j] != '\\' && s[j] != '/') {
+		return 0, "", false, 0
+	}
+	j += 1
 	start := j
-	for j < len(s) && is_path_name_byte(s[j], true) {j += 1}
+	for j < len(s) && is_path_name_byte(s[j]) {j += 1}
 	if j == start {
 		return 0, "", false, 0
 	}
@@ -366,7 +378,7 @@ match_home_unix :: proc(s: string, i: int) -> (int, string, bool, int) {
 		return 0, "", false, 0
 	}
 	start := j
-	for j < len(s) && is_path_name_byte(s[j], false) {j += 1}
+	for j < len(s) && is_path_name_byte(s[j]) {j += 1}
 	if j == start {
 		return 0, "", false, 0
 	}

@@ -19,11 +19,13 @@ may break the API.
   `errorCapture.enabled` is false (absent means on). Up to 5 captures wait
   for the first settings or session answer, then are sent or discarded.
 - Device scrub of automatic captures (`scrub_error_text`), matching the
-  shared scrub vectors (version 3). Each field is cut to 4 times its limit
+  shared scrub vectors (version 5). Each field is cut to 4 times its limit
   before the scrub and to the limit after, and every scrub pass is linear,
   so a 200,000 character line scrubs in milliseconds. Per run caps: 30 captures, 3 per dedupe key, 10
   trails, 6 a minute. The SDK's own lines and anything logged inside
   `tick()`, `shutdown()` or a callback are never captured.
+- A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 - Error events queue behind gameplay events and a full queue drops the
   oldest error first; an error never evicts a gameplay event. A `413` on a batch is split like a `400`, never resent
   as is.

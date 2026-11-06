@@ -224,7 +224,7 @@ event meter like any other event. The message is cut to 200 characters,
 the stack to 2,000, and both are scrubbed on the device before they are
 queued: emails become `[email]`; bearer tokens, JWTs, `gt_` keys and long
 runs with a digit become `[token]`; IP addresses become `[ip]`; your home
-folder becomes `~`; a URL loses its query and fragment. Your manual
+folder (the whole name, spaces included) becomes `~`; a URL loses its query and fragment. Your manual
 `track_error` call is not scrubbed on the device (the server scrubs it) and
 is never blocked by the switch.
 
