@@ -595,6 +595,7 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 		maybe_queue_game_started(client)
 	} else {
 		drop_pending_feedback(client, "disabled")
+		capture_remove_crash_files(client)
 	}
 	sync_reason(client)
 }
@@ -1452,6 +1453,10 @@ handle_side_response :: proc(client: ^Client, t: ^Transfer, status: int) {
 
 @(private)
 dispatch :: proc(client: ^Client, sig: Signals) {
+	// Lines a Ravensight callback logs are never captured, however the
+	// answer that fired it was delivered.
+	capture_quiet += 1
+	defer capture_quiet -= 1
 	if !core_is_active(&client.core) { clear_config(client, true) }
 	if sig.key_refused && !client.warned_key {
 		client.warned_key = true

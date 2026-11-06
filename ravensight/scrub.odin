@@ -31,9 +31,17 @@ package ravensight
 
 import "core:strings"
 
+when ODIN_TEST {
+	// Scrubs so far. Tests only: proves a capped capture is never scrubbed.
+	scrub_calls: int
+}
+
 // Scrubs `text` with the contract's rules. The result is allocated with
 // `allocator` (the temp allocator by default).
 scrub_error_text :: proc(text: string, allocator := context.temp_allocator) -> string {
+	when ODIN_TEST {
+		scrub_calls += 1
+	}
 	if len(text) == 0 {
 		return strings.clone(text, allocator)
 	}

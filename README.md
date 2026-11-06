@@ -202,7 +202,7 @@ Odin context value.
 | Hook | What it captures | Event |
 | --- | --- | --- |
 | `context.logger = rs.logger(previous)` | `.Error` and `.Fatal` lines, with the call site as the stack. Every line still goes to `previous` unchanged. | `rs_source: "log"`, `rs_severity` `warning` for `.Error` and `critical` for `.Fatal`, `rs_error_type` `log.Error` or `log.Fatal` |
-| `context.assertion_failure_proc = rs.assertion_failure_handler(previous)` | A failed `assert`, a `panic`, anything that calls the assertion procedure. The record is scrubbed and written synchronously next to the storage file (`ravensight.json.crash.0` to `.4`, one per crash, never overwritten), then `previous` runs, so the game dies exactly as it would have. Each file is removed once the server accepts its event, or when it will never be sent. | Sent on the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` the runtime's prefix such as `runtime assertion` |
+| `context.assertion_failure_proc = rs.assertion_failure_handler(previous)` | A failed `assert`, a `panic`, anything that calls the assertion procedure. The record is scrubbed and written synchronously next to the storage file (`ravensight.json.crash.0` to `.4`, one per crash, never overwritten), then `previous` runs, so the game dies exactly as it would have. Each file is removed once the server accepts its event, or when it will never be sent: after 30 days, on an opt-out or on `reset_device_id`. | Sent on the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` the runtime's prefix such as `runtime assertion` |
 
 To set the fields yourself, `rs.error_capture_values()` returns both, and
 `rs.destroy_logger(l)` frees a logger made by `rs.logger` and returns the
@@ -215,7 +215,8 @@ forwarded to it.
 (`errorCapture.enabled` on the settings or session answer; a server that
 does not send it means on). Until the first answer arrives, at most 5
 captures wait in memory; they are sent if the answer says on and discarded
-unsent otherwise. A crash from the last run waits the same way. With the
+unsent otherwise, and a `.Error` line never pushes a `.Fatal` line or a
+crash out of them. A crash from the last run waits the same way. With the
 hooks installed and capture off, they only forward.
 
 **What is sent.** One ordinary `error` event per capture, on the shared
@@ -228,7 +229,8 @@ folder becomes `~`; a URL loses its query and fragment. Your manual
 is never blocked by the switch.
 
 **The trail.** `.Warning` and lower lines go into an in-memory ring of the
-last 20, never written to disk except inside a crash record, and there
+last 20 (dropped before they are copied once the trail switch is known to
+be off), never written to disk except inside a crash record, and there
 only when the trail switch is already known to be on. It is attached
 to an error as `rs_trail` (`+<ms since start> <level> <text>`, each line
 scrubbed and cut to 120 characters, 1,500 in all) only when the game's
