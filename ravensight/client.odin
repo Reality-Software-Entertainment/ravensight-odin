@@ -681,6 +681,11 @@ reset_device_id :: proc(client: ^Client) -> string {
 	capture_reset(client)
 	core_discard_queue(&client.core)
 	core_invalidate_session(&client.core)
+	// The file was deleted: read it again (empty) so this run's events are
+	// saved from now on.
+	if core_is_active(&client.core) {
+		load_queue(client)
+	}
 	drop_pending_feedback(client, "device_id_reset")
 	sync_reason(client)
 	return client.device_id
@@ -886,8 +891,8 @@ tick_protocol :: proc(client: ^Client) {
 // queue is read again, empty, when collecting starts.
 @(private)
 forget_queue :: proc(client: ^Client) {
-	if path := queue_path(client); len(path) > 0 && os.exists(path) {
-		os.remove(path)
+	if path := queue_path(client); len(path) > 0 {
+		remove_queue_files(path)
 	}
 	client.queue_loaded = false
 }

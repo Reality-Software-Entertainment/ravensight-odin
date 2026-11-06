@@ -20,7 +20,9 @@ at release.
 
 - Saved queue beside the storage file, `queue-<hash>.json`, format version 2, written atomically whenever it changes, at most 500 events, 89 days, read by `create()`; deleted on opt-out and `reset_device_id`.
 - The shared error queue rules: gameplay events (a game's own errors included) go before captured errors, also after the queue is read from disk; a capture evicts only the oldest capture, never a gameplay event; `rs_trail` is never written to the queue file; opting out or resetting the id deletes persisted captures, as it already deleted crash records. Crash events that have their own crash record are not written to the queue file, so they are never sent twice, and the crash records an answer settles are removed for every settling answer (any 2xx, an indexed 400, a dropped request), not only a 202. Nothing in the batch in flight is ever evicted: with nothing else to make room, the incoming event is dropped.
-- The queue file is excluded from Time Machine on macOS.
+- The queue file is excluded from Time Machine on macOS, on every write and on a file read at start; a failed call is retried once, then logs one warning with no file contents.
+- Opt-out, a device id reset and an emptied queue also delete a temporary file a write left behind; a failed write or rename deletes its temporary file.
+- After `reset_device_id` the queue is saved again: it was left unread, so nothing tracked later in that run was saved.
 - Each session's `origin` is saved with its events and sent on every event a later session delivers.
 - gzip for request bodies of 1,024 bytes or more on macOS and Linux (system zlib); a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as in 0.5.0).
 - Request signing with `core:crypto/hmac` when the session answer has `signing`, with the clock corrected by `serverTime`.

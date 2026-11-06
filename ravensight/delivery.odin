@@ -56,17 +56,50 @@ attribution_flag_path :: proc(client: ^Client) -> string {
 	return path
 }
 
+// A replacement for the backup exclusion, set by a test on its own thread;
+// nil means exclude_from_backup.
+@(private, thread_local)
+backup_exclude_override: proc(path: string) -> (bool, bool)
+
+// Keeps a file out of backups where the system has a way to say so, with
+// one retry. A second failure logs one warning that names no file contents.
+@(private)
+exclude_with_retry :: proc(client: ^Client, path: string) {
+	exclude := backup_exclude_override != nil ? backup_exclude_override : exclude_from_backup
+	done, supported := exclude(path)
+	if supported && !done {
+		done, _ = exclude(path)
+		if !done {
+			log(client, .Warning, "Ravensight: could not keep the event queue out of backups.")
+		}
+	}
+}
+
+// Deletes the queue file and any temporary file a write left behind.
+@(private)
+remove_queue_files :: proc(path: string) {
+	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
+	for p in ([]string{path, tmp}) {
+		if os.exists(p) {
+			os.remove(p)
+		}
+	}
+}
+
 // Writes `text` to a temporary file and renames it over `path`, so a partial
-// write never replaces a good file.
-write_atomic :: proc(path: string, text: string) -> bool {
+// write never replaces a good file. A failed write or rename deletes the
+// temporary file.
+write_atomic :: proc(client: ^Client, path: string, text: string) -> bool {
 	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
 	if os.write_entire_file(tmp, transmute([]u8)text) != nil {
+		if os.exists(tmp) {
+			os.remove(tmp)
+		}
 		return false
 	}
 	// The queue holds origin stamps and scrubbed captures: keep it out of
-	// backups where the system has a way to say so. Set on the new file, so
-	// the rename carries it over.
-	exclude_from_backup(tmp)
+	// backups. Set on the new file, so the rename carries it over.
+	exclude_with_retry(client, tmp)
 	if os.rename(tmp, path) != nil {
 		os.remove(tmp)
 		return false
@@ -86,9 +119,7 @@ persist_queue :: proc(client: ^Client, stopping := false) {
 	}
 	client.core.queue_dirty = false
 	if len(client.core.queue) == 0 {
-		if os.exists(path) {
-			os.remove(path)
-		}
+		remove_queue_files(path)
 		return
 	}
 	b := strings.builder_make(context.temp_allocator)
@@ -126,12 +157,10 @@ persist_queue :: proc(client: ^Client, stopping := false) {
 	}
 	strings.write_string(&b, `]}]}`)
 	if written == 0 {
-		if os.exists(path) {
-			os.remove(path)
-		}
+		remove_queue_files(path)
 		return
 	}
-	if !write_atomic(path, strings.to_string(b)) {
+	if !write_atomic(client, path, strings.to_string(b)) {
 		log(client, .Warning, "Ravensight: could not save the event queue.")
 	}
 }
@@ -153,6 +182,9 @@ load_queue :: proc(client: ^Client) {
 	if rerr != nil {
 		return
 	}
+	// A file from an older version, or one copied in, is kept out of
+	// backups too.
+	exclude_with_retry(client, path)
 	parsed, perr := json.parse(data, spec = .JSON, parse_integers = true, allocator = context.temp_allocator)
 	if perr != nil {
 		client.core.queue_dirty = true

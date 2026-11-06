@@ -696,3 +696,106 @@ test_error_rule_inflight_never_evicted :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(full.queue), 2)
 	testing.expect_value(t, full.queue[1].name, "w")
 }
+
+@(test)
+test_queue_temp_file_never_left_behind :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	cl := fake_client(t, &f, Config{})
+	defer close_client(cl)
+	boot_with(t, &f, cl, session_json(ORIGIN_A))
+	path := queue_file_of(&f)
+	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
+	partial := "{\"partial"
+	track(cl, "a")
+	tick(cl)
+	_ = os.write_entire_file(tmp, transmute([]u8)partial)
+	set_tracking_enabled(cl, false)
+	testing.expect(t, !os.exists(path) && !os.exists(tmp), "opt-out deletes the file and a leftover temporary file")
+	set_tracking_enabled(cl, true)
+	track(cl, "b")
+	tick(cl)
+	_ = os.write_entire_file(tmp, transmute([]u8)partial)
+	reset_device_id(cl)
+	testing.expect(t, !os.exists(tmp), "a device id reset deletes it too")
+	track(cl, "c")
+	tick(cl)
+	testing.expect(t, os.exists(path), "events tracked after a reset are saved again")
+	_ = os.write_entire_file(tmp, transmute([]u8)partial)
+	// Answer whatever opens (a new session, then the batch) until the queue
+	// is empty.
+	for _ in 0 ..< 10 {
+		if queue_len(cl) == 0 {
+			break
+		}
+		flush(cl)
+		tick(cl)
+		for r, i in f.requests {
+			if r.answered {
+				continue
+			}
+			if r.path == "/session" {
+				answer(&f, i, 201, session_json(ORIGIN_B))
+				break
+			} else if r.path == "/track/batch" {
+				answer(&f, i, 202)
+				break
+			}
+		}
+	}
+	testing.expect_value(t, queue_len(cl), 0)
+	testing.expect(t, !os.exists(path) && !os.exists(tmp), "an emptied queue deletes both")
+	// A rename that fails (a folder sits where the file goes) deletes its
+	// temporary file.
+	os.make_directory_all(fmt.tprintf("%s/inner", path))
+	track(cl, "d")
+	tick(cl)
+	testing.expect(t, !os.exists(tmp), "a failed rename leaves no temporary file")
+	os.remove_all(path)
+}
+
+@(private="file", thread_local)
+exclude_calls: int
+@(private="file", thread_local)
+exclude_succeed_on: int
+
+@(test)
+test_backup_exclusion_retried_once_with_one_warning :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	rec: Recorder
+	defer recorder_destroy(&rec)
+	defer backup_exclude_override = nil
+	cl := fake_client(t, &f, Config{callbacks = recorder_callbacks(&rec)})
+	defer close_client(cl)
+	boot_with(t, &f, cl, session_json(ORIGIN_A))
+	track(cl, "a")
+	exclude_calls, exclude_succeed_on = 0, 0
+	backup_exclude_override = proc(path: string) -> (bool, bool) {
+		exclude_calls += 1
+		return exclude_calls == exclude_succeed_on, true
+	}
+	persist_queue(cl, stopping = true)
+	testing.expect_value(t, exclude_calls, 2)
+	warnings := 0
+	for line in rec.logs {
+		if strings.contains(line, "out of backups") {
+			warnings += 1
+			testing.expect(t, !strings.contains(line, "ses_a") && !strings.contains(line, "o1."), "no file contents")
+		}
+	}
+	testing.expect_value(t, warnings, 1)
+	testing.expect(t, os.exists(queue_file_of(&f)), "the queue is still written")
+	exclude_calls, exclude_succeed_on = 0, 2
+	persist_queue(cl, stopping = true)
+	testing.expect_value(t, exclude_calls, 2) // a retry that succeeds
+	backup_exclude_override = proc(path: string) -> (bool, bool) {
+		exclude_calls += 1
+		return false, false
+	}
+	exclude_calls = 0
+	persist_queue(cl, stopping = true)
+	testing.expect_value(t, exclude_calls, 1) // no retry where there is no such call
+}

@@ -453,7 +453,10 @@ Rotate it from the dashboard at any time.
   its queue in memory only.
 * **Device backups.** The file holds origin stamps and scrubbed error
   captures, so it stays out of backups. On macOS the SDK marks it excluded
-  from Time Machine itself (the attribute `tmutil addexclusion` writes).
+  from Time Machine itself (the attribute `tmutil addexclusion` writes), on
+  every write and on a file it reads at start; a failed call is retried
+  once, then logs one warning (never the file's contents) and the queue is
+  still written.
   Windows and Linux have no common way to say it, so nothing is done
   there. An iOS build should also set `NSURLIsExcludedFromBackupKey` on
   the folder holding the storage file from the app's native code.

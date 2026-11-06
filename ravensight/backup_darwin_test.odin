@@ -31,3 +31,21 @@ test_queue_file_excluded_from_time_machine :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(buf[:max(n, 0)]), BACKUP_EXCLUDE_VALUE)
 	_ = fmt.tprint("")
 }
+
+@(test)
+test_existing_queue_file_excluded_on_load :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	os.make_directory_all(f.dir)
+	path := queue_file_of(&f)
+	text := `{"version":2,"groups":[{"events":[{"event":"old","timestamp":900000,"data":{}}]}]}`
+	_ = os.write_entire_file(path, transmute([]u8)text)
+	buf: [128]u8
+	cpath := strings.clone_to_cstring(path, context.temp_allocator)
+	testing.expect(t, getxattr(cpath, BACKUP_EXCLUDE_NAME, &buf[0], len(buf), 0, 0) < 0, "not excluded before")
+	cl := fake_client(t, &f, Config{})
+	defer close_client(cl)
+	n := getxattr(cpath, BACKUP_EXCLUDE_NAME, &buf[0], len(buf), 0, 0)
+	testing.expect_value(t, string(buf[:max(n, 0)]), BACKUP_EXCLUDE_VALUE)
+}
