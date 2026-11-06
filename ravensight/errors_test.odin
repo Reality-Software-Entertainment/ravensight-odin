@@ -616,13 +616,17 @@ test_capture_spent_caps_scrub_nothing :: proc(t: ^testing.T) {
 	tick(cl)
 	testing.expect_value(t, len(queued_errors(cl)), 6)
 	// The bucket is empty: further errors (with a trail to format) are never scrubbed.
-	before := scrub_calls
-	for _ in 0 ..< 10 {
-		clog.warn("before")
-		clog.error("late gt_live_abc123")
+	// scrub_calls exists only under ODIN_TEST, and this file is also compiled
+	// into ordinary builds of the package (the examples).
+	when ODIN_TEST {
+		before := scrub_calls
+		for _ in 0 ..< 10 {
+			clog.warn("before")
+			clog.error("late gt_live_abc123")
+		}
+		tick(cl)
+		testing.expect_value(t, scrub_calls, before)
 	}
-	tick(cl)
-	testing.expect_value(t, scrub_calls, before)
 	testing.expect_value(t, len(queued_errors(cl)), 6)
 	capture_close(cl)
 }
