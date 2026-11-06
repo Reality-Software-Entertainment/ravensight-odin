@@ -30,3 +30,6 @@ jobs:
 
       - name: Build example
         run: odin build examples/minimal -out:minimal.bin
+
+      - name: Build error capture sample
+        run: odin build examples/error_capture -out:error_capture.bin

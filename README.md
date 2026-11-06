@@ -21,6 +21,16 @@ What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
   `client.odin` through a fake transport and a real storage file in a
   temporary folder; 10 cover the public build rules the same way.
 * `odin build examples/minimal` builds.
+* Error capture (Unreleased): `odin test ravensight` runs 120 tests, 25 of
+  them on capture: the shared scrub vectors and each scrub rule, the 413
+  split and queue order in the core, and the logger, trail, caps, boot hold,
+  switches, consent and crash file through the fake transport. The real
+  hooks were also run once: `examples/error_capture` against a local mock
+  API logged an error and failed an assertion; the next launch sent the
+  crash (`rs_source: "crash"`, critical, with its trail) after
+  `game_started` and `game_exited`, and the process still exited the way
+  the default assertion procedure exits. Not yet seen in the Errors view
+  against the real local API.
 * The libcurl transport was run end to end against a local mock server:
   settings, session, batch and feedback requests, the playtest header from
   the command line, and the storage file.
@@ -172,6 +182,73 @@ start to `create()`. Nothing is sent from `tick`, and nothing at all if no
 sample was taken. Memory is not reported, because Odin has no portable way to
 read it. The session request also carries `"sdk": "odin/<version>"`.
 
+## Error capture
+
+Errors in a live game go unnoticed unless something reports them. Odin has
+no global error hook: errors reach your game through `context.logger` and
+`context.assertion_failure_proc`, which are scope based. So capture is one
+line at the top of `main`, after `create()`:
+
+```odin
+analytics, _ := rs.create(rs.Config{ingest_key = RAVENSIGHT_KEY})
+context = rs.install_error_capture()
+```
+
+`install_error_capture()` returns your context with two values replaced,
+each chaining to what was there before. Calling it again changes nothing.
+Threads you start inherit it only if you pass the context along, as with any
+Odin context value.
+
+| Hook | What it captures | Event |
+| --- | --- | --- |
+| `context.logger = rs.logger(previous)` | `.Error` and `.Fatal` lines, with the call site as the stack. Every line still goes to `previous` unchanged. | `rs_source: "log"`, `rs_severity` `warning` for `.Error` and `critical` for `.Fatal`, `rs_error_type` `log.Error` or `log.Fatal` |
+| `context.assertion_failure_proc = rs.assertion_failure_handler(previous)` | A failed `assert`, a `panic`, anything that calls the assertion procedure. The record is scrubbed and written synchronously next to the storage file (`ravensight.json.crash`), then `previous` runs, so the game dies exactly as it would have. | Sent on the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` the runtime's prefix such as `runtime assertion` |
+
+To set the fields yourself, `rs.error_capture_values()` returns both, and
+`rs.destroy_logger(l)` frees a logger made by `rs.logger` and returns the
+one it wrapped. The capture logger's lowest level is `Info` (or your
+logger's, if lower); lines below your logger's own level are still not
+forwarded to it.
+
+**When it runs.** Never without a key, before the player's yes with
+`.Opt_In`, after an opt-out, or while the game's error capture switch is off
+(`errorCapture.enabled` on the settings or session answer; a server that
+does not send it means on). Until the first answer arrives, at most 5
+captures wait in memory; they are sent if the answer says on and discarded
+unsent otherwise. A crash from the last run waits the same way. With the
+hooks installed and capture off, they only forward.
+
+**What is sent.** One ordinary `error` event per capture, on the shared
+event meter like any other event. The message is cut to 200 characters,
+the stack to 2,000, and both are scrubbed on the device before they are
+queued: emails become `[email]`; bearer tokens, JWTs, `gt_` keys and long
+runs with a digit become `[token]`; IP addresses become `[ip]`; your home
+folder becomes `~`; a URL loses its query and fragment. Your manual
+`track_error` call is not scrubbed on the device (the server scrubs it) and
+is never blocked by the switch.
+
+**The trail.** `.Warning` and lower lines go into an in-memory ring of the
+last 20, never written to disk except inside a crash record. It is attached
+to an error as `rs_trail` (`+<ms since start> <level> <text>`, each line
+scrubbed and cut to 120 characters, 1,500 in all) only when the game's
+trail switch (`errorCapture.trail`) is on, and never sent on its own.
+
+**Limits on the device.** Per run: 30 captures, 3 with the same type,
+message (digits ignored) and location, 10 trails, and at most 6 a minute.
+Anything over is dropped silently. Error events queue behind gameplay
+events, so an error storm cannot hold gameplay back, and a full queue drops
+its oldest error first.
+
+**Never captured.** The SDK's own log lines (they start with
+`Ravensight: `), and anything logged while the SDK is running: inside
+`tick()`, `shutdown()` or any Ravensight callback. A host that sends
+`on_log` to its own logger cannot make a loop.
+
+Threads: the capture logger may be called from any thread. It only copies
+the line into a small fixed buffer under a lock (at most 16 waiting); the
+event is built on your next `tick()`. One client receives captures, the
+last one created; `shutdown()` stops it.
+
 ## Feedback
 
 ```odin
@@ -200,6 +277,10 @@ client and does nothing.
 | `track_resource(client, flow, resource, amount, item_type, item_id, extra, name)` | Typed resource source or sink event. |
 | `track_progression(client, status, p1, p2, p3, score, extra, name)` | Typed progression start, complete or fail event. |
 | `track_error(client, severity, message, stack, extra, name)` | Typed error event; message and stack are cut to length. |
+| `install_error_capture() -> runtime.Context` | The caller's context with error capture installed. See "Error capture". |
+| `logger(previous) -> runtime.Logger`, `destroy_logger(l)` | The capture logger alone, and freeing it. |
+| `assertion_failure_handler(previous) -> runtime.Assertion_Failure_Proc` | The capture assertion procedure alone. |
+| `scrub_error_text(text) -> string` | The device scrub, for text you send yourself. |
 | `submit_feedback(client, message, category, rating)` | Posts player feedback. Result arrives via callbacks. |
 | `fetch_suggestions(client)` | EXPERIMENTAL. AI generated design suggestions for your game, via `on_suggestions`. While not active it makes no request and answers `"[]"`. |
 | `set_tracking_enabled(client, bool)` | The player's choice, saved and read again on every launch. |
@@ -361,7 +442,7 @@ Rotate it from the dashboard at any time.
 * **Rate limits.** A `429` honors `Retry-After` in seconds, and so does a
   `503`. With no such header the SDK backs off from 10 seconds to a 5 minute
   ceiling. The queue is held.
-* **Oversize batches.** A `400` halves the batch and retries down to a single
+* **Oversize batches.** A `400` or a `413` halves the batch and retries down to a single
   event. An event still rejected on its own is dropped (counted in
   `stats().dropped`, logged once) so it cannot block everything behind it.
 * **Kill switch.** `GET /settings` is read once at boot, before anything
@@ -478,6 +559,9 @@ ravensight/
   client.odin       the public API. Owns one Core plus one curl multi handle,
                     pumps both from tick(), serializes with core:encoding/json.
   identity.odin     the storage file, the device id and the playtest sources.
+  errors.odin       automatic error capture: the logger, the assertion
+                    procedure, the crash file, caps and the trail.
+  scrub.odin        the device scrub, pure, tested against the shared vectors.
   curl.odin         minimal libcurl foreign binding (multi interface).
   core_test.odin    deterministic tests for every retry path.
   client_test.odin  the public API through a fake transport.
@@ -497,6 +581,7 @@ get the last batch out.
 ```bash
 odin test ravensight          # local protocol and typed-event tests
 odin build examples/minimal   # the example compiles and links libcurl
+odin build examples/error_capture   # the capture sample (local API only)
 ```
 
 The client tests use a fake transport and write their storage files to a
