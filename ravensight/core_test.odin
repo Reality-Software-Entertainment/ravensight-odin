@@ -778,3 +778,16 @@ test_full_queue_drops_the_oldest_error_first :: proc(t: ^testing.T) {
 	testing.expect_value(t, c.queue[2].name, "g2")
 	testing.expect_value(t, c.stats.dropped, 1)
 }
+
+@(test)
+test_an_error_never_evicts_a_gameplay_event :: proc(t: ^testing.T) {
+	c := core_make(max_queue = 2)
+	defer core_destroy(&c)
+	core_track(&c, "g0", "", T0)
+	core_track(&c, "g1", "", T0)
+	testing.expect(t, !core_track(&c, "err0", "", T0, is_error = true))
+	testing.expect_value(t, len(c.queue), 2)
+	testing.expect_value(t, c.queue[0].name, "g0")
+	testing.expect_value(t, c.queue[1].name, "g1")
+	testing.expect_value(t, c.stats.dropped, 1)
+}

@@ -11,8 +11,10 @@ may break the API.
   (critical) with the call site; warnings and lower feed an in-memory trail
   of 20 lines, attached only when the game's trail switch is on.
   `ravensight.assertion_failure_handler(previous)` writes a scrubbed crash
-  record synchronously, chains to the previous procedure, and the next
-  launch sends it as `rs_source: "crash"`.
+  record synchronously (at most 5 files, never overwritten, with the trail
+  only when the trail switch is known on), chains to the previous
+  procedure, and the next launch sends it as `rs_source: "crash"`,
+  removing the file once the server accepts it.
 - Off without a key, before consent, after opt-out, and while the game's
   `errorCapture.enabled` is false (absent means on). Up to 5 captures wait
   for the first settings or session answer, then are sent or discarded.
@@ -23,10 +25,10 @@ may break the API.
   trails, 6 a minute. The SDK's own lines and anything logged inside
   `tick()`, `shutdown()` or a callback are never captured.
 - Error events queue behind gameplay events and a full queue drops the
-  oldest error first. A `413` on a batch is split like a `400`, never resent
+  oldest error first; an error never evicts a gameplay event. A `413` on a batch is split like a `400`, never resent
   as is.
 - `examples/error_capture`, which talks to a local API only.
-- Verified: 122 Odin tests and one real run of the hooks against a local
+- Verified: 124 Odin tests and one real run of the hooks against a local
   mock API. Not yet verified against the real local API or on Windows and
   Linux.
 

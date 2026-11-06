@@ -21,7 +21,7 @@ What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
   `client.odin` through a fake transport and a real storage file in a
   temporary folder; 10 cover the public build rules the same way.
 * `odin build examples/minimal` builds.
-* Error capture (Unreleased): `odin test ravensight` runs 122 tests, 27 of
+* Error capture (Unreleased): `odin test ravensight` runs 124 tests, 29 of
   them on capture: the shared scrub vectors and each scrub rule, the 413
   split and queue order in the core, and the logger, trail, caps, boot hold,
   switches, consent and crash file through the fake transport. The real
@@ -202,7 +202,7 @@ Odin context value.
 | Hook | What it captures | Event |
 | --- | --- | --- |
 | `context.logger = rs.logger(previous)` | `.Error` and `.Fatal` lines, with the call site as the stack. Every line still goes to `previous` unchanged. | `rs_source: "log"`, `rs_severity` `warning` for `.Error` and `critical` for `.Fatal`, `rs_error_type` `log.Error` or `log.Fatal` |
-| `context.assertion_failure_proc = rs.assertion_failure_handler(previous)` | A failed `assert`, a `panic`, anything that calls the assertion procedure. The record is scrubbed and written synchronously next to the storage file (`ravensight.json.crash`), then `previous` runs, so the game dies exactly as it would have. | Sent on the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` the runtime's prefix such as `runtime assertion` |
+| `context.assertion_failure_proc = rs.assertion_failure_handler(previous)` | A failed `assert`, a `panic`, anything that calls the assertion procedure. The record is scrubbed and written synchronously next to the storage file (`ravensight.json.crash.0` to `.4`, one per crash, never overwritten), then `previous` runs, so the game dies exactly as it would have. Each file is removed once the server accepts its event, or when it will never be sent. | Sent on the next launch: `rs_source: "crash"`, `rs_severity: "critical"`, `rs_error_type` the runtime's prefix such as `runtime assertion` |
 
 To set the fields yourself, `rs.error_capture_values()` returns both, and
 `rs.destroy_logger(l)` frees a logger made by `rs.logger` and returns the
@@ -228,7 +228,8 @@ folder becomes `~`; a URL loses its query and fragment. Your manual
 is never blocked by the switch.
 
 **The trail.** `.Warning` and lower lines go into an in-memory ring of the
-last 20, never written to disk except inside a crash record. It is attached
+last 20, never written to disk except inside a crash record, and there
+only when the trail switch is already known to be on. It is attached
 to an error as `rs_trail` (`+<ms since start> <level> <text>`, each line
 scrubbed and cut to 120 characters, 1,500 in all) only when the game's
 trail switch (`errorCapture.trail`) is on, and never sent on its own.
@@ -236,8 +237,8 @@ trail switch (`errorCapture.trail`) is on, and never sent on its own.
 **Limits on the device.** Per run: 30 captures, 3 with the same type,
 message (digits ignored) and location, 10 trails, and at most 6 a minute.
 Anything over is dropped silently. Error events queue behind gameplay
-events, so an error storm cannot hold gameplay back, and a full queue drops
-its oldest error first.
+events, so an error storm cannot hold gameplay back; a full queue drops its
+oldest error first, and an error never pushes out a gameplay event.
 
 **Never captured.** The SDK's own log lines (they start with
 `Ravensight: `), and anything logged while the SDK is running: inside

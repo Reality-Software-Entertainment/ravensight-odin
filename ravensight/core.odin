@@ -84,6 +84,7 @@ Core_Event :: struct {
 	data_json:   string, // owned by the core; pre-serialized JSON object, "" means {}
 	timestamp_s: i64,    // unix seconds, captured when the event happened
 	is_error:    bool,   // an error event: queued behind gameplay events
+	tag:         int,    // the caller's marker, carried untouched (0 for none)
 }
 
 Request_Kind :: enum {
@@ -301,8 +302,9 @@ core_discard_queue :: proc(c: ^Core) {
 // Gameplay events keep their place ahead of errors: an error is appended at
 // the end, and a gameplay event is placed in front of the errors queued
 // after the batch in flight, so an error storm can never hold gameplay back.
-// When the queue is full the oldest error goes first, then the oldest event.
-core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_error := false) -> bool {
+// When the queue is full the oldest error goes first, then the oldest event;
+// a new error never evicts a gameplay event, it is dropped itself.
+core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_error := false, tag := 0) -> bool {
 	if !core_is_active(c) || len(name) == 0 {
 		return false
 	}
@@ -315,6 +317,12 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 			if c.queue[i].is_error {
 				victim = i
 				break
+			}
+		}
+		if victim == 0 && (floor == len(c.queue) || !c.queue[floor].is_error) {
+			if is_error {
+				c.stats.dropped += 1
+				return false
 			}
 		}
 		if victim == 0 && floor > 0 && floor < len(c.queue) {
@@ -336,6 +344,7 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 		data_json   = strings.clone(data_json, c.allocator),
 		timestamp_s = now_ms / 1000,
 		is_error    = is_error,
+		tag         = tag,
 	}
 	at := len(c.queue)
 	if !is_error {

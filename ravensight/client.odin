@@ -481,7 +481,7 @@ track :: proc(client: ^Client, name: string, data: any = nil) -> bool {
 
 // track with the error flag: error events queue behind gameplay events.
 @(private)
-track_event :: proc(client: ^Client, name: string, data: any, is_error: bool) -> bool {
+track_event :: proc(client: ^Client, name: string, data: any, is_error: bool, tag := 0) -> bool {
 	if client == nil {
 		return false
 	}
@@ -519,7 +519,7 @@ track_event :: proc(client: ^Client, name: string, data: any, is_error: bool) ->
 		}
 		return false
 	}
-	return core_track(&client.core, name, data_json, client_now(client), is_error)
+	return core_track(&client.core, name, data_json, client_now(client), is_error, tag)
 }
 
 // Asks for queued events to be sent on the next tick(), without waiting for
@@ -1364,7 +1364,18 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 	case .Batch, .None:
 	}
 
+	// The events this answer settles for good: accepted, or a single event
+	// the server will never take. Copied before the core frees them.
+	settled: []Core_Event
+	if t.kind == .Batch && client.core.in_flight_queue_gen == client.core.queue_gen {
+		n := min(client.core.in_flight_batch, len(client.core.queue))
+		if status == 202 || ((status == 400 || status == 413) && n == 1) {
+			settled = make([]Core_Event, n, context.temp_allocator)
+			copy(settled, client.core.queue[:n])
+		}
+	}
 	sig := core_on_response(&client.core, res, client_now(client))
+	capture_events_settled(client, settled)
 	dispatch(client, sig)
 	if ec_answer {
 		capture_answer(client, ec_present, ec_enabled, ec_trail)

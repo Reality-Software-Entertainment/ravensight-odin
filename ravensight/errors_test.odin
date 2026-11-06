@@ -422,11 +422,14 @@ test_capture_crash_persists_and_sends_on_next_launch :: proc(t: ^testing.T) {
 	defer fake_destroy(&f)
 	sink: Log_Sink
 	defer sink_destroy(&sink)
-	crash_path := strings.concatenate({storage_in(&f), CRASH_FILE_SUFFIX}, context.temp_allocator)
+	base := strings.concatenate({storage_in(&f), CRASH_FILE_SUFFIX}, context.temp_allocator)
+	crash_path := crash_file_path(base, 0)
 
 	a := capture_client(t, &f)
+	capture_boot(t, &f, a, `{"trackingEnabled":true,"errorCapture":{"enabled":true,"trail":true}}`)
 	context.logger = logger(sink_logger(&sink))
 	defer destroy_logger(context.logger)
+	f.now = T0
 	clog.info("opened inventory")
 	// What the assertion procedure does before it calls the previous one.
 	loc := runtime.Source_Code_Location{file_path = "/Users/jacob/game/src/inventory.odin", line = 88, column = 3, procedure = "move_item"}
@@ -435,8 +438,13 @@ test_capture_crash_persists_and_sends_on_next_launch :: proc(t: ^testing.T) {
 	capture_close(a)
 
 	b := capture_client(t, &f)
-	testing.expect(t, !os.exists(crash_path)) // read once, then removed
 	testing.expect_value(t, len(b.capture.held), 1)
+	testing.expect(t, os.exists(crash_path)) // kept until the server takes it
+	// A second crash before the answer neither loses nor replaces the first.
+	testing.expect(t, capture_persist_crash("panic", "second", loc))
+	testing.expect(t, os.exists(crash_path))
+	testing.expect(t, os.exists(crash_file_path(base, 1)))
+	os.remove(crash_file_path(base, 1))
 	capture_boot(t, &f, b, `{"trackingEnabled":true,"errorCapture":{"enabled":true,"trail":true}}`)
 	errs := queued_errors(b)
 	testing.expect_value(t, len(errs), 1)
@@ -449,6 +457,11 @@ test_capture_crash_persists_and_sends_on_next_launch :: proc(t: ^testing.T) {
 		testing.expect_value(t, str_of(e, "rs_stack"), "at move_item (~/game/src/inventory.odin:88:3)")
 		testing.expect_value(t, str_of(e, "rs_trail"), "+0 info opened inventory")
 	}
+	testing.expect(t, os.exists(crash_path))
+	flush(b, force = true)
+	tick(b)
+	answer_next(t, &f, "/track/batch", 202, `{"accepted":2}`)
+	testing.expect(t, !os.exists(crash_path)) // accepted, so removed
 	capture_close(b)
 }
 
@@ -459,7 +472,7 @@ test_capture_crash_dropped_unsent_after_opt_out :: proc(t: ^testing.T) {
 	f: Fake
 	fake_init(&f)
 	defer fake_destroy(&f)
-	crash_path := strings.concatenate({storage_in(&f), CRASH_FILE_SUFFIX}, context.temp_allocator)
+	crash_path := crash_file_path(strings.concatenate({storage_in(&f), CRASH_FILE_SUFFIX}, context.temp_allocator), 0)
 
 	a := capture_client(t, &f)
 	loc := runtime.Source_Code_Location{file_path = "main.odin", line = 1, column = 1, procedure = "main"}
@@ -537,4 +550,37 @@ test_trail_lines_are_scrubbed_cut_and_bounded :: proc(t: ^testing.T) {
 	q := prepare_capture(SEVERITY_WARNING, ERROR_SOURCE_LOG, "log.Error", "enemy 7 lost", "a.odin", "f", 9, 9)
 	r := prepare_capture(SEVERITY_WARNING, ERROR_SOURCE_LOG, "log.Error", "enemy 1234 lost", "a.odin", "f", 30, 1)
 	testing.expect_value(t, q.key, r.key) // line and number do not split the key
+}
+
+@(test)
+test_capture_crash_record_has_no_trail_unless_the_switch_is_on :: proc(t: ^testing.T) {
+	sync.mutex_lock(&capture_test_mutex)
+	defer sync.mutex_unlock(&capture_test_mutex)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	sink: Log_Sink
+	defer sink_destroy(&sink)
+	crash_path := crash_file_path(strings.concatenate({storage_in(&f), CRASH_FILE_SUFFIX}, context.temp_allocator), 0)
+	loc := runtime.Source_Code_Location{file_path = "main.odin", line = 1, column = 1, procedure = "main"}
+
+	cl := capture_client(t, &f)
+	context.logger = logger(sink_logger(&sink))
+	defer destroy_logger(context.logger)
+	clog.info("player typed their name")
+	// Before any answer the switch is unknown: no trail on disk.
+	testing.expect(t, capture_persist_crash("panic", "boom", loc))
+	p, ok := read_crash_file(crash_path)
+	testing.expect(t, ok)
+	testing.expect_value(t, p.trail, "")
+	os.remove(crash_path)
+
+	// Known and off: still none.
+	capture_boot(t, &f, cl, `{"trackingEnabled":true,"errorCapture":{"enabled":true,"trail":false}}`)
+	clog.info("another line")
+	testing.expect(t, capture_persist_crash("panic", "boom", loc))
+	p, ok = read_crash_file(crash_path)
+	testing.expect(t, ok)
+	testing.expect_value(t, p.trail, "")
+	capture_close(cl)
 }

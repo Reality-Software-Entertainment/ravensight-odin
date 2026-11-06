@@ -17,7 +17,8 @@
 //     A failed assert or a panic is scrubbed and written synchronously next
 //     to the storage file, then the previous procedure runs as before (the
 //     process still dies the way it would have). The next launch sends it
-//     as one critical event, rs_source "crash".
+//     as one critical event, rs_source "crash", and removes the file once
+//     the server has accepted it. At most 5 wait on disk.
 //
 // Nothing is captured without a key, before consent, after opt-out, or
 // while the game's errorCapture.enabled is false (absent means on). Until
@@ -58,8 +59,10 @@ CAPTURE_REFILL_MS :: 10_000 // one token back every 10 seconds, 6 a minute
 MAX_BOOT_CAPTURES :: 5
 // Captures waiting for the next tick(); past this they are dropped.
 CAPTURE_INBOX_SIZE :: 16
-// The crash file sits next to the storage file.
+// Crash files sit next to the storage file: <storage>.crash.0 to .4, one
+// per crash, each removed once its event is accepted (or will never be).
 CRASH_FILE_SUFFIX :: ".crash"
+MAX_CRASH_FILES :: MAX_BOOT_CAPTURES
 MAX_CRASH_FILE_BYTES :: 16_384
 
 // What install_error_capture changes in a context, for hosts that prefer to
@@ -128,6 +131,7 @@ Prepared_Capture :: struct {
 	stack:      string,
 	trail:      string,
 	key:        string,
+	crash_slot: int, // 1 + the crash file it came from; 0 for none
 }
 
 // Per-client capture state, game thread only.
@@ -152,7 +156,8 @@ Capture_Client :: struct {
 Capture_Global :: struct {
 	mutex:       sync.Mutex,
 	client:      ^Client,
-	armed:       bool, // the bound client may capture right now
+	armed:       bool, // the bound client may capture right now; read atomically
+	trail_on:    bool, // the game's trail switch is known and on
 	clock_user:  rawptr,
 	clock:       proc(user: rawptr) -> i64,
 	inbox:       [CAPTURE_INBOX_SIZE]Raw_Capture,
@@ -284,6 +289,9 @@ capture_clock :: proc() -> i64 {
 // Called by the logger on any thread: copies the line, nothing else.
 @(private)
 capture_record :: proc(level: runtime.Logger_Level, text: string, loc: runtime.Source_Code_Location) {
+	if !sync.atomic_load(&capture_global.armed) {
+		return // the common case when capture is off: no lock at all
+	}
 	sync.mutex_lock(&capture_global.mutex)
 	defer sync.mutex_unlock(&capture_global.mutex)
 	if !capture_global.armed {
@@ -317,20 +325,31 @@ capture_record :: proc(level: runtime.Logger_Level, text: string, loc: runtime.S
 	fixed_set(&raw.procedure, loc.procedure)
 }
 
-// The trail lines older than `upto`, oldest first, formatted, scrubbed, each
-// cut to 120 characters, newest kept within 1,500. Caller holds the mutex.
+// Copies the trail lines older than `upto`, oldest first, into the temp
+// allocator. Caller holds the mutex; nothing is formatted or scrubbed here.
 @(private)
-capture_trail_text :: proc(upto: u64, start_ms: i64) -> string {
-	lines := make([dynamic]string, context.temp_allocator)
+capture_trail_snapshot :: proc(upto: u64) -> []Trail_Line {
+	lines := make([dynamic]Trail_Line, context.temp_allocator)
 	first := upto > TRAIL_LINES ? upto - TRAIL_LINES : 0
 	for seq in first ..< upto {
 		slot := &capture_global.trail[seq % TRAIL_LINES]
 		if slot.seq != seq {
 			continue // overwritten by a newer line
 		}
-		append(&lines, trail_line(slot.at_ms - start_ms, slot.level, fixed_get(&slot.text)))
+		append(&lines, slot^)
 	}
-	return join_trail(lines[:])
+	return lines[:]
+}
+
+// The trail text: each line formatted, scrubbed and cut to 120, newest kept
+// within 1,500. Runs outside the lock.
+@(private)
+trail_text :: proc(lines: []Trail_Line, start_ms: i64) -> string {
+	out := make([dynamic]string, context.temp_allocator)
+	for &l in lines {
+		append(&out, trail_line(l.at_ms - start_ms, l.level, fixed_get(&l.text)))
+	}
+	return join_trail(out[:])
 }
 
 // One trail line: `+<ms> <level> <text>`, scrubbed and cut to 120.
@@ -429,6 +448,12 @@ Crash_Record :: struct {
 	key:        string,
 }
 
+// The crash file for `slot` (0 to MAX_CRASH_FILES - 1).
+@(private)
+crash_file_path :: proc(base: string, slot: int) -> string {
+	return fmt.tprintf("%s.%d", base, slot)
+}
+
 // Writes a failed assertion to the crash file, synchronously, when the
 // bound client may capture. Scrubbed before it reaches the disk.
 @(private)
@@ -445,12 +470,30 @@ capture_persist_crash :: proc(prefix, message: string, loc: runtime.Source_Code_
 		return false // never wait on a lock this thread may already hold
 	}
 	armed := capture_global.armed
-	path := strings.clone(fixed_get(&capture_global.crash_path))
-	trail := armed ? capture_trail_text(capture_global.trail_seq, capture_global.start_ms) : ""
+	base := strings.clone(fixed_get(&capture_global.crash_path))
+	start_ms := capture_global.start_ms
+	// The trail goes to disk only when the game's trail switch is known on.
+	lines: []Trail_Line
+	if armed && capture_global.trail_on {
+		lines = capture_trail_snapshot(capture_global.trail_seq)
+	}
 	sync.mutex_unlock(&capture_global.mutex)
-	if !armed || len(path) == 0 {
+	if !armed || len(base) == 0 {
 		return false
 	}
+	// The first free slot; an earlier crash still waiting is never replaced.
+	path := ""
+	for slot in 0 ..< MAX_CRASH_FILES {
+		candidate := crash_file_path(base, slot)
+		if !os.exists(candidate) {
+			path = candidate
+			break
+		}
+	}
+	if len(path) == 0 {
+		return false
+	}
+	trail := trail_text(lines, start_ms)
 	kind := len(prefix) > 0 ? prefix : "assertion"
 	p := prepare_capture(SEVERITY_CRITICAL, ERROR_SOURCE_CRASH, kind, message, loc.file_path, loc.procedure, loc.line, loc.column, trail)
 	return write_crash_file(path, p)
@@ -474,18 +517,36 @@ write_crash_file :: proc(path: string, p: Prepared_Capture) -> bool {
 	return true
 }
 
-// Reads and removes the crash file of an earlier run. Only a client that may
-// capture keeps it (held until the answer); any other drops it unsent.
+// Reads the crash files of earlier runs. A client that may capture holds
+// them until the answer and removes each file once its event is accepted;
+// any other client removes them unsent. An unreadable file is removed.
 @(private)
 capture_load_crash :: proc(cl: ^Client) {
-	path := cl.capture.crash_path
-	if len(path) == 0 || !os.exists(path) {
+	base := cl.capture.crash_path
+	if len(base) == 0 {
 		return
 	}
-	defer os.remove(path)
-	if !capture_should_run(cl) {
-		return
+	for slot in 0 ..< MAX_CRASH_FILES {
+		path := crash_file_path(base, slot)
+		if !os.exists(path) {
+			continue
+		}
+		if !capture_should_run(cl) {
+			os.remove(path)
+			continue
+		}
+		p, ok := read_crash_file(path)
+		if !ok {
+			os.remove(path)
+			continue
+		}
+		p.crash_slot = slot + 1
+		capture_accept(cl, p)
 	}
+}
+
+@(private)
+read_crash_file :: proc(path: string) -> (p: Prepared_Capture, ok: bool) {
 	info, serr := os.stat(path, context.temp_allocator)
 	if serr != nil || info.size > MAX_CRASH_FILE_BYTES {
 		return
@@ -499,7 +560,7 @@ capture_load_crash :: proc(cl: ^Client) {
 		return
 	}
 	// Scrubbed and cut again: the file is on the player's disk.
-	p := Prepared_Capture{
+	return Prepared_Capture{
 		severity   = SEVERITY_CRITICAL,
 		source     = ERROR_SOURCE_CRASH,
 		error_type = cut_runes(rec.error_type, MAX_ERROR_TYPE_CHARS),
@@ -507,8 +568,25 @@ capture_load_crash :: proc(cl: ^Client) {
 		stack      = scrub_field(rec.stack, MAX_ERROR_STACK_CHARS),
 		trail      = scrub_field(rec.trail, MAX_TRAIL_CHARS),
 		key        = rec.key,
+	}, true
+}
+
+// Removes the crash file a capture came from: its event was accepted, or
+// will never be sent.
+@(private)
+capture_forget_crash :: proc(cl: ^Client, crash_slot: int) {
+	if crash_slot <= 0 || len(cl.capture.crash_path) == 0 {
+		return
 	}
-	capture_accept(cl, p)
+	os.remove(crash_file_path(cl.capture.crash_path, crash_slot - 1))
+}
+
+// Called with the events the server just accepted or dropped for good.
+@(private)
+capture_events_settled :: proc(cl: ^Client, events: []Core_Event) {
+	for evt in events {
+		capture_forget_crash(cl, evt.tag)
+	}
 }
 
 // --- The client side (game thread) -----------------------------------------------------
@@ -577,8 +655,11 @@ capture_sync :: proc(cl: ^Client) {
 	on := capture_should_run(cl)
 	if cl.capture.bound {
 		sync.mutex_lock(&capture_global.mutex)
+		if capture_global.client == cl {
+			capture_global.trail_on = on && cl.capture.known && cl.capture.trail
+		}
 		if capture_global.client == cl && capture_global.armed != on {
-			capture_global.armed = on
+			sync.atomic_store(&capture_global.armed, on)
 			if !on {
 				capture_global.inbox_len = 0
 				capture_global.trail_seq = 0
@@ -588,13 +669,18 @@ capture_sync :: proc(cl: ^Client) {
 		sync.mutex_unlock(&capture_global.mutex)
 	}
 	if !on {
-		capture_drop_held(cl)
+		capture_drop_held(cl, true)
 	}
 }
 
+// Forgets what is held. `discard` also removes held crash files, for
+// captures that will never be sent; at shutdown they stay for next launch.
 @(private)
-capture_drop_held :: proc(cl: ^Client) {
+capture_drop_held :: proc(cl: ^Client, discard: bool) {
 	for p in cl.capture.held {
+		if discard {
+			capture_forget_crash(cl, p.crash_slot)
+		}
 		capture_free(cl, p)
 	}
 	clear(&cl.capture.held)
@@ -621,12 +707,11 @@ capture_answer :: proc(cl: ^Client, present, enabled, trail: bool) {
 		return
 	}
 	held := cl.capture.held[:]
-	if capture_should_run(cl) {
-		for p in held {
-			capture_emit(cl, p)
-		}
-	}
+	run := capture_should_run(cl)
 	for p in held {
+		if !run || !capture_emit(cl, p) {
+			capture_forget_crash(cl, p.crash_slot)
+		}
 		capture_free(cl, p)
 	}
 	clear(&cl.capture.held)
@@ -638,19 +723,23 @@ capture_drain :: proc(cl: ^Client) {
 	if !cl.capture.bound {
 		return
 	}
-	ready := make([dynamic]Prepared_Capture, context.temp_allocator)
+	// Copy under the lock; scrub and format after it.
+	raws := make([dynamic]Raw_Capture, context.temp_allocator)
+	trails := make([dynamic][]Trail_Line, context.temp_allocator)
+	start_ms: i64
 	sync.mutex_lock(&capture_global.mutex)
 	if capture_global.client == cl {
+		start_ms = capture_global.start_ms
 		for i in 0 ..< capture_global.inbox_len {
-			raw := &capture_global.inbox[i]
-			trail := capture_trail_text(raw.trail_seq, capture_global.start_ms)
-			append(&ready, prepare_capture(raw.severity, raw.source, raw.error_type, fixed_get(&raw.message), fixed_get(&raw.file), fixed_get(&raw.procedure), raw.line, raw.column, trail))
+			append(&raws, capture_global.inbox[i])
+			append(&trails, capture_trail_snapshot(capture_global.inbox[i].trail_seq))
 		}
 		capture_global.inbox_len = 0
 	}
 	sync.mutex_unlock(&capture_global.mutex)
-	for p in ready {
-		capture_accept(cl, p)
+	for &raw, i in raws {
+		trail := trail_text(trails[i], start_ms)
+		capture_accept(cl, prepare_capture(raw.severity, raw.source, raw.error_type, fixed_get(&raw.message), fixed_get(&raw.file), fixed_get(&raw.procedure), raw.line, raw.column, trail))
 	}
 }
 
@@ -658,14 +747,17 @@ capture_drain :: proc(cl: ^Client) {
 @(private)
 capture_accept :: proc(cl: ^Client, p: Prepared_Capture) {
 	if !capture_should_run(cl) {
+		capture_forget_crash(cl, p.crash_slot)
 		return
 	}
 	if cl.capture.known {
-		capture_emit(cl, p)
+		if !capture_emit(cl, p) {
+			capture_forget_crash(cl, p.crash_slot) // over a cap: never sent
+		}
 		return
 	}
 	if len(cl.capture.held) >= MAX_BOOT_CAPTURES {
-		return
+		return // a crash file stays on disk for the next launch
 	}
 	append(&cl.capture.held, Prepared_Capture{
 		severity   = p.severity,
@@ -675,6 +767,7 @@ capture_accept :: proc(cl: ^Client, p: Prepared_Capture) {
 		stack      = strings.clone(p.stack, cl.allocator),
 		trail      = strings.clone(p.trail, cl.allocator),
 		key        = strings.clone(p.key, cl.allocator),
+		crash_slot = p.crash_slot,
 	})
 }
 
@@ -712,7 +805,7 @@ capture_emit :: proc(cl: ^Client, p: Prepared_Capture) -> bool {
 		props["rs_trail"] = json.String(p.trail)
 	}
 	capture_quiet += 1
-	ok := track_event(cl, "error", props, true)
+	ok := track_event(cl, "error", props, true, p.crash_slot)
 	capture_quiet -= 1
 	if !ok {
 		return false
@@ -733,7 +826,7 @@ capture_emit :: proc(cl: ^Client, p: Prepared_Capture) -> bool {
 // A new identity: nothing captured under the old one is kept or sent.
 @(private)
 capture_reset :: proc(cl: ^Client) {
-	capture_drop_held(cl)
+	capture_drop_held(cl, true)
 	if cl.capture.bound {
 		sync.mutex_lock(&capture_global.mutex)
 		if capture_global.client == cl {
@@ -743,15 +836,20 @@ capture_reset :: proc(cl: ^Client) {
 		}
 		sync.mutex_unlock(&capture_global.mutex)
 	}
-	if len(cl.capture.crash_path) > 0 && os.exists(cl.capture.crash_path) {
-		os.remove(cl.capture.crash_path)
+	if len(cl.capture.crash_path) > 0 {
+		for slot in 0 ..< MAX_CRASH_FILES {
+			path := crash_file_path(cl.capture.crash_path, slot)
+			if os.exists(path) {
+				os.remove(path)
+			}
+		}
 	}
 }
 
 @(private)
 capture_destroy :: proc(cl: ^Client) {
 	capture_unbind(cl)
-	capture_drop_held(cl)
+	capture_drop_held(cl, false) // undelivered crash files are sent next launch
 	delete(cl.capture.held)
 	for k in cl.capture.keys {
 		delete(k, cl.allocator)
