@@ -3,7 +3,9 @@
 package ravensight
 
 import "core:encoding/json"
+import "core:strings"
 import "core:testing"
+import "core:time"
 
 expect_scrub :: proc(t: ^testing.T, input, want: string, loc := #caller_location) {
 	got := scrub_error_text(input)
@@ -110,4 +112,27 @@ test_scrub_empty_and_plain_text :: proc(t: ^testing.T) {
 	expect_scrub(t, "", "")
 	expect_scrub(t, "Player 42 not found", "Player 42 not found")
 	expect_scrub(t, "héllo wörld ✓", "héllo wörld ✓")
+}
+
+@(test)
+test_scrub_ipv6_needs_a_digit_and_urls_lose_userinfo :: proc(t: ^testing.T) {
+	expect_scrub(t, "call Face::Add failed", "call Face::Add failed")
+	expect_scrub(t, "aaaa:bbbb:cccc:dddd:eeee:ffff:abcd:dcba", "aaaa:bbbb:cccc:dddd:eeee:ffff:abcd:dcba")
+	expect_scrub(t, "fetch https://admin:hunter2@cdn.example.com/a.png", "fetch https://cdn.example.com/a.png")
+}
+
+@(test)
+test_scrub_is_fast_on_a_huge_line :: proc(t: ^testing.T) {
+	patterns := [?]string{"a", "a.", "1", "1.", "a@", "a:", "/a", "x1y2", "eyJa."}
+	for p in patterns {
+		huge := strings.repeat(p, 200_000 / len(p), context.temp_allocator)
+		start := time.tick_now()
+		// The field path: cut to 4 times the limit, scrub, cut to the limit.
+		field := scrub_field(huge, MAX_ERROR_STACK_CHARS)
+		testing.expect(t, strings.rune_count(field) <= MAX_ERROR_STACK_CHARS)
+		// The whole 200,000 characters, scrubbed directly, is linear too.
+		_ = scrub_error_text(huge)
+		elapsed := time.tick_since(start)
+		testing.expectf(t, elapsed < 2 * time.Second, "%q took %v", p, elapsed)
+	}
 }

@@ -349,7 +349,7 @@ trail_line :: proc(ms: i64, level: runtime.Logger_Level, text: string) -> string
 	}
 	flat, _ := strings.replace_all(text, "\n", " ", context.temp_allocator)
 	line := fmt.tprintf("+%d %s %s", max(ms, 0), name, flat)
-	return cut_runes(scrub_error_text(line), MAX_TRAIL_LINE_CHARS)
+	return scrub_field(line, MAX_TRAIL_LINE_CHARS)
 }
 
 // Joins trail lines oldest first, dropping the oldest until it fits 1,500.
@@ -395,15 +395,15 @@ prepare_capture :: proc(
 	line, column: i32,
 	trail := "",
 ) -> Prepared_Capture {
-	msg := cut_runes(scrub_error_text(message), MAX_ERROR_MESSAGE_CHARS)
+	msg := scrub_field(message, MAX_ERROR_MESSAGE_CHARS)
 	stack := ""
 	if len(file) > 0 || len(procedure) > 0 {
 		frame := fmt.tprintf("at %s (%s:%d:%d)", len(procedure) > 0 ? procedure : "?", file, line, column)
-		stack = cut_runes(scrub_error_text(frame), MAX_ERROR_STACK_CHARS)
+		stack = scrub_field(frame, MAX_ERROR_STACK_CHARS)
 	}
 	kind := cut_runes(error_type, MAX_ERROR_TYPE_CHARS)
 	// The first frame's file and procedure, without line and column.
-	frame_key := fmt.tprintf("%s#%s", scrub_error_text(file), procedure)
+	frame_key := fmt.tprintf("%s#%s", scrub_field(file, MAX_ERROR_STACK_CHARS), cut_runes(procedure, MAX_ERROR_TYPE_CHARS))
 	return Prepared_Capture{
 		severity   = severity,
 		source     = source,
@@ -503,9 +503,9 @@ capture_load_crash :: proc(cl: ^Client) {
 		severity   = SEVERITY_CRITICAL,
 		source     = ERROR_SOURCE_CRASH,
 		error_type = cut_runes(rec.error_type, MAX_ERROR_TYPE_CHARS),
-		message    = cut_runes(scrub_error_text(rec.message), MAX_ERROR_MESSAGE_CHARS),
-		stack      = cut_runes(scrub_error_text(rec.stack), MAX_ERROR_STACK_CHARS),
-		trail      = cut_runes(scrub_error_text(rec.trail), MAX_TRAIL_CHARS),
+		message    = scrub_field(rec.message, MAX_ERROR_MESSAGE_CHARS),
+		stack      = scrub_field(rec.stack, MAX_ERROR_STACK_CHARS),
+		trail      = scrub_field(rec.trail, MAX_TRAIL_CHARS),
 		key        = rec.key,
 	}
 	capture_accept(cl, p)

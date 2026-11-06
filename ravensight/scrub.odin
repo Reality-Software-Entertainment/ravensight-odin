@@ -12,7 +12,8 @@
 //   4. C:\Users\<name> (either slash, any drive letter), /Users/<name> and
 //      /home/<name> become ~.
 //   5. An IPv4 address becomes [ip]; so does an IPv6 address written in
-//      full (eight groups) or compressed with ::, when it has a digit.
+//      full (eight groups) or compressed with ::. An IPv6 match must have a
+//      digit, so `Face::Add` is left alone.
 //   6. A run of 32 or more characters from [A-Za-z0-9+/=_-] with at least
 //      one digit in it becomes [token], unless it has a '/' and every piece
 //      between slashes is empty or a path word (snake or kebab case, Pascal
@@ -23,6 +24,8 @@
 // Pure: no I/O, no clock, no state. scrub(scrub(x)) == scrub(x). Every
 // matcher is a hand-written scan that keeps the leftmost-first meaning of
 // the server's patterns; byte-wise, so multi-byte UTF-8 passes untouched.
+// Every pass is linear. Callers still cut a field to 4 times its limit
+// before scrubbing (scrub_field) and to the limit after.
 
 package ravensight
 
@@ -49,11 +52,18 @@ scrub_error_text :: proc(text: string, allocator := context.temp_allocator) -> s
 	return strings.clone(s, allocator)
 }
 
+// Cuts `text` to 4 times `limit` characters, scrubs it, and cuts the result
+// to `limit`: a huge line never costs more than a bounded scrub.
+scrub_field :: proc(text: string, limit: int) -> string {
+	return cut_runes(scrub_error_text(cut_runes(text, 4 * limit)), limit)
+}
+
 // A matcher looks for one match starting exactly at `i`. On a match it
 // returns where the match ends and what replaces it (possibly the matched
-// text itself, when a candidate is kept).
+// text itself, when a candidate is kept). On a miss, `resume` past `i` says
+// no match can start before it, which keeps every pass linear.
 @(private)
-Scrub_Matcher :: #type proc(s: string, i: int) -> (end: int, replacement: string, ok: bool)
+Scrub_Matcher :: #type proc(s: string, i: int) -> (end: int, replacement: string, ok: bool, resume: int)
 
 // Replaces every leftmost, non-overlapping match, like a global regex
 // replace. Allocates in the temp allocator.
@@ -62,9 +72,15 @@ scrub_pass :: proc(s: string, match: Scrub_Matcher) -> string {
 	b := strings.builder_make(context.temp_allocator)
 	i := 0
 	for i < len(s) {
-		if end, rep, ok := match(s, i); ok && end > i {
+		end, rep, ok, resume := match(s, i)
+		if ok && end > i {
 			strings.write_string(&b, rep)
 			i = end
+			continue
+		}
+		if !ok && resume > i + 1 {
+			strings.write_string(&b, s[i:resume])
+			i = resume
 			continue
 		}
 		strings.write_byte(&b, s[i])
@@ -146,16 +162,16 @@ has_digit :: proc(s: string) -> bool {
 
 // 1. scheme://[userinfo@]host/path[?query][#fragment] keeps scheme, host and path.
 @(private)
-match_url :: proc(s: string, i: int) -> (int, string, bool) {
+match_url :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_alpha_byte(s[i]) || !boundary_before(s, i) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i + 1
 	for j < len(s) && (is_alnum_byte(s[j]) || s[j] == '+' || s[j] == '.' || s[j] == '-') {
 		j += 1
 	}
 	if !strings.has_prefix(s[j:], "://") {
-		return 0, "", false
+		return 0, "", false, j // every start inside this run stops at the same place
 	}
 	j += 3
 	head := s[i:j]
@@ -189,18 +205,18 @@ match_url :: proc(s: string, i: int) -> (int, string, bool) {
 			q += 1
 		}
 	}
-	return q, strings.concatenate({head, path}, context.temp_allocator), true
+	return q, strings.concatenate({head, path}, context.temp_allocator), true, 0
 }
 
 // 2a. Bearer <token>
 @(private)
-match_bearer :: proc(s: string, i: int) -> (int, string, bool) {
+match_bearer :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !boundary_before(s, i) || !match_fold(s, i, "bearer") {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i + 6
 	if j >= len(s) || !is_space_byte(s[j]) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	for j < len(s) && is_space_byte(s[j]) {
 		j += 1
@@ -214,12 +230,12 @@ match_bearer :: proc(s: string, i: int) -> (int, string, bool) {
 		j += 1
 	}
 	if j == start {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	for j < len(s) && s[j] == '=' {
 		j += 1
 	}
-	return j, "[token]", true
+	return j, "[token]", true, 0
 }
 
 @(private)
@@ -229,40 +245,40 @@ is_jwt_byte :: proc(c: u8) -> bool {
 
 // 2b. eyJ<segment>.<segment>.<segment?>
 @(private)
-match_jwt :: proc(s: string, i: int) -> (int, string, bool) {
+match_jwt :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !boundary_before(s, i) || !strings.has_prefix(s[i:], "eyJ") {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i + 3
 	start := j
 	for j < len(s) && is_jwt_byte(s[j]) {j += 1}
 	if j == start || j >= len(s) || s[j] != '.' {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j += 1
 	start = j
 	for j < len(s) && is_jwt_byte(s[j]) {j += 1}
 	if j == start || j >= len(s) || s[j] != '.' {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j += 1
 	for j < len(s) && is_jwt_byte(s[j]) {j += 1}
-	return j, "[token]", true
+	return j, "[token]", true, 0
 }
 
 // 2c. gt_<key>
 @(private)
-match_gt_key :: proc(s: string, i: int) -> (int, string, bool) {
+match_gt_key :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !boundary_before(s, i) || !strings.has_prefix(s[i:], "gt_") {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i + 3
 	start := j
 	for j < len(s) && is_word_byte(s[j]) {j += 1}
 	if j == start {
-		return 0, "", false
+		return 0, "", false, 0
 	}
-	return j, "[token]", true
+	return j, "[token]", true, 0
 }
 
 @(private)
@@ -272,14 +288,14 @@ is_email_local_byte :: proc(c: u8) -> bool {
 
 // 3. local@domain.tld, with the longest domain whose last label is 2+ letters.
 @(private)
-match_email :: proc(s: string, i: int) -> (int, string, bool) {
+match_email :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_email_local_byte(s[i]) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i
 	for j < len(s) && is_email_local_byte(s[j]) {j += 1}
 	if j >= len(s) || s[j] != '@' {
-		return 0, "", false
+		return 0, "", false, j
 	}
 	d := j + 1
 	e := d
@@ -291,10 +307,10 @@ match_email :: proc(s: string, i: int) -> (int, string, bool) {
 		n := k + 1
 		for n < e && is_alpha_byte(s[n]) {n += 1}
 		if n - (k + 1) >= 2 {
-			return n, "[email]", true
+			return n, "[email]", true, 0
 		}
 	}
-	return 0, "", false
+	return 0, "", false, j // the same '@' and domain for every start in the run
 }
 
 @(private)
@@ -307,30 +323,30 @@ is_path_name_byte :: proc(c: u8, backslash_too: bool) -> bool {
 
 // 4a. C:\Users\<name> or C:/Users/<name>
 @(private)
-match_home_windows :: proc(s: string, i: int) -> (int, string, bool) {
+match_home_windows :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_alpha_byte(s[i]) || !boundary_before(s, i) || i + 9 >= len(s) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	if s[i + 1] != ':' || (s[i + 2] != '\\' && s[i + 2] != '/') || !match_fold(s, i + 3, "users") {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	if s[i + 8] != '\\' && s[i + 8] != '/' {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i + 9
 	start := j
 	for j < len(s) && is_path_name_byte(s[j], true) {j += 1}
 	if j == start {
-		return 0, "", false
+		return 0, "", false, 0
 	}
-	return j, "~", true
+	return j, "~", true, 0
 }
 
 // 4b. /Users/<name> or /home/<name>
 @(private)
-match_home_unix :: proc(s: string, i: int) -> (int, string, bool) {
+match_home_unix :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if s[i] != '/' {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	rest := s[i + 1:]
 	j: int
@@ -339,86 +355,89 @@ match_home_unix :: proc(s: string, i: int) -> (int, string, bool) {
 	} else if strings.has_prefix(rest, "home/") {
 		j = i + 6
 	} else {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	start := j
 	for j < len(s) && is_path_name_byte(s[j], false) {j += 1}
 	if j == start {
-		return 0, "", false
+		return 0, "", false, 0
 	}
-	return j, "~", true
+	return j, "~", true, 0
 }
 
 // The length of the run of `pred` bytes starting at `i`.
 @(private)
-run_of :: proc(s: string, i: int, pred: proc(c: u8) -> bool) -> int {
+run_of :: proc(s: string, i: int, pred: proc(c: u8) -> bool, limit := max(int)) -> int {
 	j := i
-	for j < len(s) && pred(s[j]) {j += 1}
+	for j < len(s) && j - i < limit && pred(s[j]) {j += 1}
 	return j - i
 }
 
 // 5a. \b(\d{1,3}\.){3}\d{1,3}\b
 @(private)
-match_ipv4 :: proc(s: string, i: int) -> (int, string, bool) {
+match_ipv4 :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_digit_byte(s[i]) || !boundary_before(s, i) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i
 	for g in 0 ..< 4 {
-		n := run_of(s, j, is_digit_byte)
+		n := run_of(s, j, is_digit_byte, 4)
 		if n < 1 || n > 3 {
-			return 0, "", false
+			return 0, "", false, 0
 		}
 		j += n
 		if g < 3 {
 			if j >= len(s) || s[j] != '.' {
-				return 0, "", false
+				return 0, "", false, 0
 			}
 			j += 1
 		}
 	}
 	if !boundary_at(s, j) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
-	return j, "[ip]", true
+	return j, "[ip]", true, 0
 }
 
-// 5b. \b([0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b
+// 5b. \b([0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b, only with a digit in it
 @(private)
-match_ipv6_full :: proc(s: string, i: int) -> (int, string, bool) {
+match_ipv6_full :: proc(s: string, i: int) -> (int, string, bool, int) {
 	if !is_hex_byte(s[i]) || !boundary_before(s, i) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j := i
 	for g in 0 ..< 8 {
-		n := run_of(s, j, is_hex_byte)
+		n := run_of(s, j, is_hex_byte, 5)
 		if n < 1 || n > 4 {
-			return 0, "", false
+			return 0, "", false, 0
 		}
 		j += n
 		if g < 7 {
 			if j >= len(s) || s[j] != ':' {
-				return 0, "", false
+				return 0, "", false, 0
 			}
 			j += 1
 		}
 	}
 	if !boundary_at(s, j) {
-		return 0, "", false
+		return 0, "", false, 0
 	}
-	return j, "[ip]", true
+	if !has_digit(s[i:j]) {
+		return j, s[i:j], true, 0 // an address has a digit; keep the text
+	}
+	return j, "[ip]", true, 0
 }
 
 // 5c. (\b h(:h){0,6})? :: (h(:h){0,6}\b)?  replaced by [ip] only when the
 // match has a digit; a match without one is kept as it is.
 @(private)
-match_ipv6_short :: proc(s: string, i: int) -> (int, string, bool) {
+match_ipv6_short :: proc(s: string, i: int) -> (int, string, bool, int) {
 	j := i
 	if is_hex_byte(s[i]) && boundary_before(s, i) {
 		k := i
 		groups := 0
 		for groups < 7 {
-			n := run_of(s, k, is_hex_byte)
+			n := run_of(s, k, is_hex_byte, 5)
 			if n < 1 || n > 4 {
 				break
 			}
@@ -436,7 +455,7 @@ match_ipv6_short :: proc(s: string, i: int) -> (int, string, bool) {
 		}
 	}
 	if !strings.has_prefix(s[j:], "::") {
-		return 0, "", false
+		return 0, "", false, 0
 	}
 	j += 2
 	// The right part: groups separated by single ':', the longest prefix of
@@ -444,7 +463,7 @@ match_ipv6_short :: proc(s: string, i: int) -> (int, string, bool) {
 	end := j
 	k := j
 	for g in 0 ..< 7 {
-		n := run_of(s, k, is_hex_byte)
+		n := run_of(s, k, is_hex_byte, 5)
 		if n < 1 || n > 4 {
 			break
 		}
@@ -460,9 +479,9 @@ match_ipv6_short :: proc(s: string, i: int) -> (int, string, bool) {
 	}
 	match := s[i:end]
 	if has_digit(match) {
-		return end, "[ip]", true
+		return end, "[ip]", true, 0
 	}
-	return end, match, true
+	return end, match, true, 0
 }
 
 @(private)
@@ -555,14 +574,14 @@ is_path_run :: proc(run: string) -> bool {
 
 // 6. [A-Za-z0-9+/=_-]{32,} with a digit in it, unless it reads as a path.
 @(private)
-match_long_run :: proc(s: string, i: int) -> (int, string, bool) {
+match_long_run :: proc(s: string, i: int) -> (int, string, bool, int) {
 	n := run_of(s, i, is_token_byte)
 	if n < 32 {
-		return 0, "", false
+		return 0, "", false, i + n
 	}
 	run := s[i:i + n]
 	if has_digit(run) && !is_path_run(run) {
-		return i + n, "[token]", true
+		return i + n, "[token]", true, 0
 	}
-	return i + n, run, true
+	return i + n, run, true, 0
 }

@@ -21,7 +21,7 @@ What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
   `client.odin` through a fake transport and a real storage file in a
   temporary folder; 10 cover the public build rules the same way.
 * `odin build examples/minimal` builds.
-* Error capture (Unreleased): `odin test ravensight` runs 120 tests, 25 of
+* Error capture (Unreleased): `odin test ravensight` runs 122 tests, 27 of
   them on capture: the shared scrub vectors and each scrub rule, the 413
   split and queue order in the core, and the logger, trail, caps, boot hold,
   switches, consent and crash file through the fake transport. The real

@@ -1,6 +1,6 @@
 {
   "about": "Shared scrub cases from docs/errors/CONTRACT.md. The server (src/services/errorScrub.js) and every SDK copy this file into their tests and must produce `out` for each `in`. Change the contract and this file together.",
-  "version": 2,
+  "version": 3,
   "cases": [
     {
       "name": "email",
@@ -91,6 +91,16 @@
       "name": "base64 with slash and padding",
       "in": "blob QmFzZTY0/ZW5jb2RlZA2ZGF0YQ8+cGFkZGluZ3Rlc3Q= end",
       "out": "blob [token] end"
+    },
+    {
+      "name": "url userinfo",
+      "in": "GET https://bob:hunter2!@api.example.com/v1/x?y=1",
+      "out": "GET https://api.example.com/v1/x"
+    },
+    {
+      "name": "cpp scope is not ipv6",
+      "in": "at Face::Add (face.cpp:12)",
+      "out": "at Face::Add (face.cpp:12)"
     }
   ]
 }
