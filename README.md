@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.4.0. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.5.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 

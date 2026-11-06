@@ -3,7 +3,7 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
-## Unreleased
+## [0.5.0] - 2026-11-06
 
 - Automatic error capture, installed with one host line after `create()`:
   `context = ravensight.install_error_capture()`. `ravensight.logger(previous)`
