@@ -1,6 +1,6 @@
 {
   "about": "Shared scrub cases from docs/errors/CONTRACT.md. The server (src/services/errorScrub.js) and every SDK copy this file into their tests and must produce `out` for each `in`. Change the contract and this file together.",
-  "version": 5,
+  "version": 6,
   "cases": [
     {
       "name": "email",
@@ -126,6 +126,11 @@
       "name": "documents and settings",
       "in": "C:\\Documents and Settings\\ann\\y.cs",
       "out": "~\\y.cs"
+    },
+    {
+      "name": "windows home with forward slashes",
+      "in": "C:/Users/Jo Ann/game/x.cs",
+      "out": "~/game/x.cs"
     }
   ]
 }
