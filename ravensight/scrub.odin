@@ -499,29 +499,42 @@ is_upper_byte :: proc(c: u8) -> bool {
 	return c >= 'A' && c <= 'Z'
 }
 
-// A piece of a path between slashes that reads as a word: empty, snake or
-// kebab case (`inventory_system2`), Pascal case (`InventorySlot2`), or a
-// short upper-case tag (`UI`, `V2`).
+// A piece of a path between slashes that reads as a word: empty, or one or
+// more parts joined by '_' or '-' (`BP_Player_Controller_2026`), each part
+// lower case (`inventory`), Pascal case (`InventorySlot2`), or an acronym of
+// 1 to 6 capitals or digits (`UI`, `V2`).
 @(private)
 is_path_word :: proc(p: string) -> bool {
 	if len(p) == 0 {
 		return true
 	}
-	// ^[a-z0-9]+([_-][a-z0-9]+)*$
-	snake := true
-	prev_sep := true
+	start := 0
+	for i in 0 ..= len(p) {
+		if i < len(p) && p[i] != '_' && p[i] != '-' {
+			continue
+		}
+		if !is_path_part(p[start:i]) {
+			return false
+		}
+		start = i + 1
+	}
+	return true
+}
+
+@(private)
+is_path_part :: proc(p: string) -> bool {
+	if len(p) == 0 {
+		return false
+	}
+	// ^[a-z0-9]+$
+	lower := true
 	for i in 0 ..< len(p) {
-		c := p[i]
-		if is_lower_digit_byte(c) {
-			prev_sep = false
-		} else if (c == '_' || c == '-') && !prev_sep {
-			prev_sep = true
-		} else {
-			snake = false
+		if !is_lower_digit_byte(p[i]) {
+			lower = false
 			break
 		}
 	}
-	if snake && !prev_sep {
+	if lower {
 		return true
 	}
 	// ^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$

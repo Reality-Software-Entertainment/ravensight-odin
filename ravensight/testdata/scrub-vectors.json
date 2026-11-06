@@ -1,6 +1,6 @@
 {
   "about": "Shared scrub cases from docs/errors/CONTRACT.md. The server (src/services/errorScrub.js) and every SDK copy this file into their tests and must produce `out` for each `in`. Change the contract and this file together.",
-  "version": 3,
+  "version": 4,
   "cases": [
     {
       "name": "email",
@@ -101,6 +101,11 @@
       "name": "cpp scope is not ipv6",
       "in": "at Face::Add (face.cpp:12)",
       "out": "at Face::Add (face.cpp:12)"
+    },
+    {
+      "name": "unreal asset path stays",
+      "in": "/Game/Blueprints/Players/BP_Player_Controller_2026.uasset",
+      "out": "/Game/Blueprints/Players/BP_Player_Controller_2026.uasset"
     }
   ]
 }
