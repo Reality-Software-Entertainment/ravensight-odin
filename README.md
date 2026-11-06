@@ -445,8 +445,10 @@ Rotate it from the dashboard at any time.
   answer removed events, to a temporary file renamed over the old one so a
   partial write never replaces a good one. It is read once by `create()`.
   At most 500 events are kept, oldest dropped first (an automatic error is
-  always dropped before a gameplay event, and queues behind gameplay), and
-  events older than 89 days are dropped when it is read. A game that is
+  always dropped before a gameplay event, and queues behind gameplay, also
+  after the file is read), and events older than 89 days are dropped when
+  it is read. A captured error's `rs_trail` is never written to it, and a
+  crash with its own crash record is not written at all. A game that is
   killed sends what it had queued on the next launch. A playtest run keeps
   its queue in memory only.
 * **Removed only when delivered.** An event leaves the file only after a 2xx
@@ -471,10 +473,8 @@ Rotate it from the dashboard at any time.
   `Retry-After` wait. With no such header the SDK backs off from 10 seconds
   to a 5 minute ceiling. The queue is held.
 * **Refusals.** A `400` naming one event by `index` drops that event and
-  resends the rest. `batch_too_large` and `413` halve the batch. A `400`
-  about one event with no index (such as `event_too_large`) halves until
-  that event is alone, then drops it. Any other `400` drops the request's
-  events. Drops are counted in `stats()`.
+  resends the rest. Only `batch_too_large` and `413` halve the batch. Any
+  other `400` drops the request's events. Drops are counted in `stats()`.
 * **Kill switch.** `GET /settings` is read once at boot, before anything
   else is sent.
 * **Forgetting.** Turning tracking off as the player, or `reset_device_id`,

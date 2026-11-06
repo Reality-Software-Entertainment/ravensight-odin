@@ -14,12 +14,12 @@ at release.
 - Experiment tags follow the exposure contract: `rs_exp_<key>` only after the session's first typed config read, with one `rs_exposure` event; a well-formed tag the game sets is kept.
 - A refused key or the kill switch keeps the queued events on disk for the next launch.
 - A batch 401 opens a new session once (was twice), then backs off. Backoff waits are multiplied by a random factor from 0.5 up to 1 (was plus or minus 20 percent).
-- A 400 that is not about one event drops that request's events instead of halving.
+- Only `400 batch_too_large` and 413 halve a batch. Any other 400 without an `index` (such as `event_too_large`) drops that request's events instead of halving.
 
 ### Added
 
 - Saved queue beside the storage file, `queue-<hash>.json`, format version 2, written atomically whenever it changes, at most 500 events, 89 days, read by `create()`; deleted on opt-out and `reset_device_id`.
-- The saved queue keeps 0.5.0's rules (errors evicted first and queued behind gameplay, a 413 split like a 400). Crash events that have their own crash record are not written to it, so they are never sent twice, and the crash records an answer settles are removed for every settling answer (any 2xx, an indexed 400, a dropped request), not only a 202.
+- The shared error queue rules: gameplay events (a game's own errors included) go before captured errors, also after the queue is read from disk; a capture evicts only the oldest capture, never a gameplay event; `rs_trail` is never written to the queue file; opting out or resetting the id deletes persisted captures, as it already deleted crash records. Crash events that have their own crash record are not written to the queue file, so they are never sent twice, and the crash records an answer settles are removed for every settling answer (any 2xx, an indexed 400, a dropped request), not only a 202.
 - Each session's `origin` is saved with its events and sent on every event a later session delivers.
 - gzip for request bodies of 1,024 bytes or more on macOS and Linux (system zlib); a 415, or a 413 for one compressed event, is resent uncompressed once (a 413 for one uncompressed event is dropped, as in 0.5.0).
 - Request signing with `core:crypto/hmac` when the session answer has `signing`, with the clock corrected by `serverTime`.

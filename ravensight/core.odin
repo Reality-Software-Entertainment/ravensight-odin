@@ -362,6 +362,27 @@ core_queue_cap :: proc(c: ^Core) -> int {
 	return clamp(c.max_queue, 1, QUEUE_MAX_EVENTS)
 }
 
+// Puts gameplay events before captured errors, keeping each group's order.
+// Only for a queue with nothing in flight (the saved queue just read).
+core_order_errors_last :: proc(c: ^Core) {
+	if c.in_flight == .Batch {
+		return
+	}
+	ordered := make([dynamic]Core_Event, 0, len(c.queue), c.allocator)
+	for evt in c.queue {
+		if !evt.is_error {
+			append(&ordered, evt)
+		}
+	}
+	for evt in c.queue {
+		if evt.is_error {
+			append(&ordered, evt)
+		}
+	}
+	delete(c.queue)
+	c.queue = ordered
+}
+
 // Removes the event at `i`, counted as dropped past the cap.
 @(private)
 core_evict :: proc(c: ^Core, i: int) {
@@ -685,9 +706,6 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 	return
 }
 
-// 400 answers about one event that carry no index: halve until it is alone.
-@(private)
-PER_EVENT_400 :: [?]string{"event_too_large", "event_name_too_long", "missing_event", "invalid_event_data", "invalid_event_id"}
 
 // Removes the first `count` queued events.
 @(private)
@@ -707,8 +725,8 @@ core_remove_front :: proc(c: ^Core, count: int) {
 //   a 400 naming an event by index drops that event, the rest are resent;
 //   batch_too_large or a 413 halves the batch;
 //   a 415 (or a 413 for one event) is resent uncompressed once, then dropped;
-//   a 400 about one event with no index halves until it is alone, then drops;
-//   any other 400 drops the request's events.
+//   any other 400 drops the request's events (only batch_too_large and a
+//   413 halve a batch).
 @(private)
 core_on_batch_refused :: proc(c: ^Core, res: Core_Response, n: int, sig: ^Signals) {
 	drop :: proc(c: ^Core, count: int, sig: ^Signals) {
@@ -743,13 +761,7 @@ core_on_batch_refused :: proc(c: ^Core, res: Core_Response, n: int, sig: ^Signal
 		drop(c, n, sig)
 		return
 	}
-	per_event := false
-	for code in PER_EVENT_400 {
-		if res.error_code == code {
-			per_event = true
-		}
-	}
-	if (res.status == 413 || res.error_code == "batch_too_large" || per_event) && n > 1 {
+	if (res.status == 413 || res.error_code == "batch_too_large") && n > 1 {
 		c.batch_limit = max(1, n / 2)
 		return
 	}

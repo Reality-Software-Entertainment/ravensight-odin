@@ -117,7 +117,7 @@ persist_queue :: proc(client: ^Client, stopping := false) {
 		strings.write_string(&b, `{"event":`)
 		write_json_string(&b, evt.name)
 		fmt.sbprintf(&b, `,"timestamp":%d,"data":`, evt.timestamp_ms)
-		strings.write_string(&b, len(evt.data_json) > 0 ? evt.data_json : "{}")
+		strings.write_string(&b, data_for_disk(evt))
 		strings.write_byte(&b, '}')
 	}
 	strings.write_string(&b, `]}]}`)
@@ -212,7 +212,30 @@ load_queue :: proc(client: ^Client) {
 			})
 		}
 	}
+	// Gameplay goes before captured errors.
+	core_order_errors_last(&client.core)
 	client.core.queue_dirty = true
+}
+
+// The data as written to the queue file: a capture's rs_trail is never
+// written to disk.
+@(private)
+data_for_disk :: proc(evt: Core_Event) -> string {
+	data := len(evt.data_json) > 0 ? evt.data_json : "{}"
+	if !strings.contains(data, `"rs_trail"`) {
+		return data
+	}
+	parsed, err := json.parse(transmute([]u8)data, spec = .JSON, parse_integers = true, allocator = context.temp_allocator)
+	if err != nil {
+		return "{}"
+	}
+	obj, ok := parsed.(json.Object)
+	if !ok {
+		return "{}"
+	}
+	delete_key(&obj, "rs_trail")
+	text, merr := json.marshal(json.Value(obj), {sort_maps_by_key = true}, context.temp_allocator)
+	return merr == nil ? string(text) : "{}"
 }
 
 // An error the SDK captured by itself: rs_kind "error" with an rs_source

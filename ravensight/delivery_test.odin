@@ -580,3 +580,77 @@ test_delivery_crash_records_settle_and_stay_out_of_the_queue_file :: proc(t: ^te
 		testing.expect(t, n != "error", "a crash with its own record is not saved twice")
 	}
 }
+
+// --- Error queue rules (all SDKs, 2026-11-06) -------------------------------------
+
+@(test)
+test_error_rule_1_gameplay_before_captures :: proc(t: ^testing.T) {
+	c := core_make()
+	defer core_destroy(&c)
+	core_track(&c, "a", "", T0)
+	core_track(&c, "capture", `{"rs_kind":"error","rs_source":"log"}`, T0, is_error = true)
+	// A game's own error is gameplay.
+	core_track(&c, "own_error", `{"rs_kind":"error","rs_source":"manual"}`, T0)
+	core_track(&c, "b", "", T0)
+	names := [4]string{}
+	for e, i in c.queue {
+		names[i] = e.name
+	}
+	testing.expect_value(t, names, [4]string{"a", "own_error", "b", "capture"})
+
+	// A queue read from disk is ordered the same way.
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	os.make_directory_all(f.dir)
+	text := `{"version":2,"groups":[{"events":[{"event":"old_capture","timestamp":900000,"data":{"rs_kind":"error","rs_source":"crash"}},{"event":"old_play","timestamp":900001,"data":{}}]}]}`
+	_ = os.write_entire_file(queue_file_of(&f), transmute([]u8)text)
+	cl := fake_client(t, &f, Config{})
+	defer close_client(cl)
+	testing.expect_value(t, cl.core.queue[0].name, "old_play")
+	testing.expect_value(t, cl.core.queue[1].name, "game_started")
+	testing.expect_value(t, cl.core.queue[2].name, "old_capture")
+}
+
+@(test)
+test_error_rule_2_full_queue :: proc(t: ^testing.T) {
+	c := core_make(max_queue = 3)
+	defer core_destroy(&c)
+	core_track(&c, "a", "", T0)
+	core_track(&c, "c1", "", T0, is_error = true)
+	core_track(&c, "c2", "", T0, is_error = true)
+	core_track(&c, "c3", "", T0, is_error = true)
+	testing.expect_value(t, c.queue[1].name, "c2") // the oldest capture went
+	testing.expect_value(t, c.queue[2].name, "c3")
+	core_track(&c, "b", "", T0)
+	core_track(&c, "x", "", T0)
+	testing.expect_value(t, c.queue[0].name, "a")
+	testing.expect_value(t, c.queue[1].name, "b")
+	testing.expect_value(t, c.queue[2].name, "x") // gameplay as before, captures first
+	testing.expect(t, !core_track(&c, "c4", "", T0, is_error = true), "with no capture queued, an incoming capture is dropped")
+	testing.expect_value(t, c.queue[0].name, "a")
+}
+
+@(test)
+test_error_rule_3_trail_never_on_disk_and_optout_deletes :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	cl := fake_client(t, &f, Config{})
+	defer close_client(cl)
+	boot_with(t, &f, cl, session_json(ORIGIN_A))
+	core_track(&cl.core, "capture", `{"rs_kind":"error","rs_source":"log","rs_trail":"+0 info entered cave"}`, client_now(cl), is_error = true)
+	tick(cl)
+	text, _ := os.read_entire_file(queue_file_of(&f), context.temp_allocator)
+	testing.expect(t, strings.contains(string(text), `"capture"`), "the capture is persisted")
+	testing.expect(t, !strings.contains(string(text), "rs_trail") && !strings.contains(string(text), "entered cave"), "its trail is not")
+	testing.expect(t, strings.contains(cl.core.queue[len(cl.core.queue) - 1].data_json, "entered cave"), "the trail stays in memory")
+	set_tracking_enabled(cl, false)
+	testing.expect(t, !os.exists(queue_file_of(&f)), "opt-out deletes persisted captures")
+	set_tracking_enabled(cl, true)
+	core_track(&cl.core, "capture", `{"rs_kind":"error","rs_source":"log"}`, client_now(cl), is_error = true)
+	tick(cl)
+	testing.expect(t, os.exists(queue_file_of(&f)))
+	reset_device_id(cl)
+	testing.expect(t, !os.exists(queue_file_of(&f)), "a device id reset deletes persisted captures")
+}

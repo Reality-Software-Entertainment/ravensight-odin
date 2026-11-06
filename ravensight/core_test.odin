@@ -220,11 +220,11 @@ test_400_splits_batch_down_to_one_then_drops :: proc(t: ^testing.T) {
 	open_session(t, &c, T0)
 	core_request_flush(&c)
 
-	// 50 -> 25 -> 12 -> 6 -> 3 -> 1, all rejected with a 400 about one
-	// event that names no index, no backoff.
+	// 50 -> 25 -> 12 -> 6 -> 3 -> 1, all rejected as batch_too_large (only
+	// it and a 413 halve), no backoff.
 	sizes := [?]int{50, 25, 12, 6, 3, 1}
 	for size in sizes {
-		sig := step_batch(t, &c, T0, size, Core_Response{status = 400, error_code = "event_too_large", index = -1})
+		sig := step_batch(t, &c, T0, size, Core_Response{status = 400, error_code = "batch_too_large", index = -1})
 		testing.expect_value(t, c.next_attempt_at_ms, i64(0))
 		if size == 1 {
 			testing.expect(t, sig.event_dropped)
@@ -240,6 +240,12 @@ test_400_splits_batch_down_to_one_then_drops :: proc(t: ^testing.T) {
 	testing.expect_value(t, c.stats.dropped, 1)
 	sig := step_batch(t, &c, T0, 49, Core_Response{status = 202})
 	testing.expect_value(t, sig.events_flushed, 49)
+
+	// Any other 400 without an index drops the whole request.
+	track_n(&c, 3, T0, "x")
+	core_request_flush(&c)
+	step_batch(t, &c, T0, 3, Core_Response{status = 400, error_code = "event_too_large", index = -1})
+	testing.expect_value(t, len(c.queue), 0)
 }
 
 @(test)
