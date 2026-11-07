@@ -295,14 +295,14 @@ test_public_backoff_jitter_bounds :: proc(t: ^testing.T) {
 	defer core_destroy(&low)
 	low.random = proc() -> f64 {return 0}
 	core_schedule_backoff(&low, T0)
-	testing.expect_value(t, low.next_attempt_at_ms - T0, i64(8_000))
+	testing.expect_value(t, low.next_attempt_at_ms - T0, i64(5_000))
 	testing.expect_value(t, low.backoff_ms, i64(20_000)) // the doubling is not spread
 
 	high := core_make()
 	defer core_destroy(&high)
 	high.random = proc() -> f64 {return 1}
 	core_schedule_backoff(&high, T0)
-	testing.expect_value(t, high.next_attempt_at_ms - T0, i64(12_000))
+	testing.expect_value(t, high.next_attempt_at_ms - T0, i64(10_000))
 	for _ in 0 ..< 10 {
 		core_schedule_backoff(&high, T0)
 	}
@@ -312,9 +312,9 @@ test_public_backoff_jitter_bounds :: proc(t: ^testing.T) {
 	defer core_destroy(&mid)
 	mid.random = proc() -> f64 {return 0.5}
 	core_schedule_backoff(&mid, T0)
-	testing.expect_value(t, mid.next_attempt_at_ms - T0, i64(10_000))
+	testing.expect_value(t, mid.next_attempt_at_ms - T0, i64(7_500))
 
-	// The real source stays inside plus or minus 20 percent.
+	// The real source stays within a factor of 0.5 up to 1.
 	spread := core_make()
 	defer core_destroy(&spread)
 	spread.random = random_unit
@@ -324,7 +324,7 @@ test_public_backoff_jitter_bounds :: proc(t: ^testing.T) {
 		core_reset_backoff(&spread)
 		core_schedule_backoff(&spread, T0)
 		wait := spread.next_attempt_at_ms - T0
-		testing.expect(t, wait >= 8_000 && wait <= 12_000)
+		testing.expect(t, wait >= 5_000 && wait <= 10_000)
 	}
 
 	// Retry-After is obeyed exactly, whatever the draw.

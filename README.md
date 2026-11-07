@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.5.0. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.6.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -296,7 +296,10 @@ client and does nothing.
 | `device_id(client)`, `is_playtest(client)` | The id this run sends, and whether a playtest token was found. |
 | `is_ready(client)`, `is_active(client)` | A session exists; tracking is on. |
 | `is_enabled(client)` | The same answer as `is_active`: true only while collecting. |
-| `queue_len(client)`, `stats(client)` | Queue depth and lifetime counters (`sent`, `dropped`, `flushes`, `sessions`). |
+| `queue_len(client)`, `stats(client)` | Queue depth and lifetime counters (`sent`, `dropped`, `flushes`, `sessions`, and of `dropped`: `dropped_overflow`, `dropped_too_old`, `dropped_refused`). |
+| `track_ad(client, network, format, result, opts)`, `track_ad_revenue(client, network, format, placement, revenue_micros, currency)` | An ad lifecycle step, or a paid impression. Returns false and sends nothing when a field is malformed. See "Ads and attribution". |
+| `micros_from_decimal_string(text)`, `micros_from_revenue(value)` | Revenue in micros as a digit string, without multiplying a float. |
+| `set_attribution(client, Attribution{...})` | Where this install was acquired, sent once per install. |
 | `shutdown(client, flush_timeout_ms)` | Queues the health summary (when opted in and sampled) and `game_exited`, one best-effort flush, then frees everything. |
 
 Results are delivered through optional callbacks in `Config.callbacks`
@@ -320,12 +323,13 @@ starts with `Ravensight: `; without a handler, warnings go to stderr.
 | `device_id` | the saved id | Overrides the saved id for this run. The saved file is not changed. |
 | `storage_path` | see "Device id and privacy" | The file holding the device id and the player's opt-out. |
 | `start_disabled` | `false` | Send nothing, not even the settings check, until `set_enabled(client, true)`. Not saved. |
-| `max_queue_size` | `500` | Offline queue cap. Oldest events are dropped first. |
+| `max_queue_size` | `500` | Queue cap, in memory and on disk, at most 500. Oldest events are dropped first (an automatic error before any gameplay event). |
 | `flush_interval_ms` | `5000` | Queued events are flushed at least this often. Negative flushes only on demand. |
 | `request_timeout_ms` | `15000` | Per request timeout. |
 | `disable_lifecycle_events` | `false` | Set true to suppress the automatic `game_started` and `game_exited` events. |
 | `performance` | `false` | Opt in to once-a-second frame sampling and the single `health` event sent from `shutdown`. See "Typed events". |
 | `playtest_token`, `playtest_run_id`, `playtest_job_id`, `playtest_persona` | `""` | Ravensight Playtest. Normally left empty; see "Playtest". |
+| `device_model`, `device_os_version`, `device_gpu` | `""` | The device fields sent on the session, as your engine reports them without a permission prompt: the model, the OS version (no OS name) and the GPU name. The SDK probes nothing itself. Each is cut to 128 printable characters; an empty one is left out. Never a hardware identifier. |
 
 ## Automatic events
 
@@ -352,9 +356,9 @@ change:
 | `.None` | Ready, or nothing has gone wrong yet. | |
 | `.No_Key` | Created with an empty `ingest_key`. | Inert: no request, no file, no libcurl. |
 | `.Disabled` | `start_disabled`, `set_enabled(false)`, the player's opt-out, or `.Opt_In` and no yes yet. | No request of any kind. |
-| `.Invalid_Key` | A `401`, or a `403` without one of the codes below, from settings, session, a batch, feedback or suggestions. | The run ends: the queue is cleared and nothing more is sent or retried, not even by `flush()`. Logged once as a warning. A `401` on a batch is an expired session instead: a new one is opened first. |
-| `.Tracking_Disabled` | The game's tracking is switched off in the dashboard (`GET /settings`, or a `403 tracking_disabled` from any request). | The queue is cleared and nothing more is sent this run. |
-| `.Offline` | No answer, a timeout or a server error. | Retried after 10 seconds, doubling to 5 minutes, each wait spread by plus or minus 20 percent. |
+| `.Invalid_Key` | A `401`, or a `403` without one of the codes below, from settings, session, a batch, feedback or suggestions. | Nothing more is sent or retried this run, not even by `flush()`; the queued events stay on disk for the next launch. Logged once as a warning. A `401` on a batch is an expired session or a refused signature instead: a new session is opened once, and a second `401` in a row waits for the backoff. |
+| `.Tracking_Disabled` | The game's tracking is switched off in the dashboard (`GET /settings`, or a `403 tracking_disabled` from any request). | Nothing more is sent this run; the queued events stay on disk. |
+| `.Offline` | No answer, a timeout or a server error. | Retried after 10 seconds, doubling to 5 minutes, each wait multiplied by a random factor from 0.5 up to 1. |
 | `.Rate_Limited` | A `429`. | Retried after exactly `Retry-After` seconds. |
 | `.Session_Failed` | `POST /session` failed, or a playtest token is unusable. | Retried, except for a playtest token, which stops the run. |
 | `.Playtest_Job_Closed` | The playtest run's job closed. | The queue is cleared and nothing more is sent this run. |
@@ -402,10 +406,12 @@ and none of these options.
   of the device id, the start time in hex, a random 8 hex character value
   made once per client from `core:crypto`, and a counter. It stays with the
   queued event, so an event sent again after a failure carries the same id
-  and the server can recognise it. The queue is in memory only; it is not
-  saved between launches. Event data that is not a JSON object is sent as
-  it is, without the id.
-* **Size cap.** An event whose data is over 8,192 bytes as JSON is dropped
+  and the server can recognise it, also from the saved queue on a later
+  launch. Event data that is not a JSON object is sent as it is, without
+  the id.
+* **Size cap.** An event whose data is over 8,192 bytes as the server
+  measures it (an error event's `rs_message`, `rs_stack` and `rs_trail`
+  count one byte a character within 200, 2,000 and 1,500) is dropped
   before it is queued: `track` returns false, `on_flush_failed` gets
   `"event_too_large"`, `stats().dropped` counts it, and one warning is
   logged for the run.
@@ -419,6 +425,7 @@ and none of these options.
 | --- | --- | --- | --- |
 | 0.2.0 | `dev-2026-08`, libcurl | `/api/v1` | The shared SDK contract. |
 | 0.3.0 | `dev-2026-08`, libcurl | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
+| 0.6.0 | `dev-2026-08`, libcurl, the system zlib on macOS and Linux | `/api/v1` | Saved queue with origins, gzip, signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 
 ## About your ingest key
 
@@ -432,24 +439,83 @@ Rotate it from the dashboard at any time.
 * **Batching.** Up to 50 events per request, the server hard limit. A send
   happens on the flush timer, at once when 50 are waiting, on `flush()` and
   on `shutdown()`, and keeps going until the queue drains.
-* **Offline queue.** Events accumulate up to `max_queue_size`. Past that the
-  oldest are dropped so the newest are always kept. The queue lives in
-  memory only.
-* **When events are dropped.** Events leave the queue when the server
-  accepts them (`202`), on overflow (oldest first), when the server rejects a
-  single event, on opt-out, on `reset_device_id`, on the kill switch, when a
-  playtest run closes, and when `shutdown()` runs out of time.
+* **Saved queue.** Unsent events are written beside the storage file as
+  `queue-<16 hex>.json` (one file per ingest key, named by a hash of the
+  key) whenever the queue changed, once per `tick()` and at once after an
+  answer removed events, to a temporary file renamed over the old one so a
+  partial write never replaces a good one. It is read once by `create()`.
+  At most 500 events are kept, oldest dropped first (an automatic error is
+  always dropped before a gameplay event, and queues behind gameplay, also
+  after the file is read), and events older than 89 days are dropped when
+  it is read. A captured error's `rs_trail` is never written to it, and a
+  crash with its own crash record is not written at all. A game that is
+  killed sends what it had queued on the next launch. A playtest run keeps
+  its queue in memory only.
+* **Device backups.** The file holds origin stamps and scrubbed error
+  captures, so it stays out of backups. On macOS the SDK marks it excluded
+  from Time Machine itself (the attribute `tmutil addexclusion` writes), on
+  every write and on a file it reads at start; a failed call is retried
+  once, then logs one warning (never the file's contents) and the queue is
+  still written.
+  Windows and Linux have no common way to say it, so nothing is done
+  there. An iOS build should also set `NSURLIsExcludedFromBackupKey` on
+  the folder holding the storage file from the app's native code.
+* **Removed only when delivered.** An event leaves the file only after a 2xx
+  answer, or a 400 that refuses it.
+* **Origin.** Each session's events are saved with the session answer's
+  `origin`, and a later launch sends them with it, so the server files them
+  under the session, build and platform they happened in. The origin's
+  `stamp` is a credential for that old session, kept only in the queue file.
+* **Compression.** A request body of 1,024 bytes or more is sent gzip
+  compressed, through the system zlib on macOS and Linux. Odin ships no
+  zlib for Windows, so Windows builds send bodies uncompressed, which the
+  server also accepts. A `415` (or a `413` for one event) is sent once more
+  uncompressed.
+* **Signing.** When the session answer has `signing` (public keys), every
+  batch carries `X-Ravensight-Timestamp` and an HMAC-SHA256
+  `X-Ravensight-Signature` over the uncompressed body (`core:crypto/hmac`),
+  with the clock corrected by the server's time. The secret stays in memory.
 * **Session expiry.** A `401` on a batch clears the session, opens a new one
-  and re-sends the same batch. After two in a row it backs off instead of
-  hot-looping.
+  once and re-sends the same batch; a second in a row backs off.
 * **Rate limits.** A `429` honors `Retry-After` in seconds, and so does a
-  `503`. With no such header the SDK backs off from 10 seconds to a 5 minute
-  ceiling. The queue is held.
-* **Oversize batches.** A `400` or a `413` halves the batch and retries down to a single
-  event. An event still rejected on its own is dropped (counted in
-  `stats().dropped`, logged once) so it cannot block everything behind it.
+  `503`. `flush(client, true)` cuts a backoff wait short but never a
+  `Retry-After` wait. With no such header the SDK backs off from 10 seconds
+  to a 5 minute ceiling. The queue is held.
+* **Refusals.** A `400` naming one event by `index` drops that event and
+  resends the rest. Only `batch_too_large` and `413` halve the batch. Any
+  other `400` drops the request's events. Drops are counted in `stats()`.
 * **Kill switch.** `GET /settings` is read once at boot, before anything
   else is sent.
+* **Forgetting.** Turning tracking off as the player, or `reset_device_id`,
+  deletes the saved queue.
+
+## Ads and attribution
+
+```odin
+// A paid impression. Revenue is MICROS as a digit string: 0.0015 USD is "1500".
+rs.track_ad_revenue(analytics, "admob", "rewarded", "level_end", "1500", "USD")
+micros, ok := rs.micros_from_revenue(revenue_double, context.temp_allocator)
+if ok { rs.track_ad_revenue(analytics, "applovin", "interstitial", "", micros, "USD") }
+// Clicks, rewards and failures carry no revenue.
+rs.track_ad(analytics, "applovin", "rewarded", "rewarded", rs.Ad_Options{placement = "shop"})
+// Where this install came from, once per install.
+rs.set_attribution(analytics, rs.Attribution{source = "store_referrer", campaign = "spring"})
+```
+
+`format` is one of `banner`, `interstitial`, `rewarded`, `native`,
+`app_open`, `other`; `result` one of `shown`, `clicked`, `failed`,
+`rewarded`. Revenue goes on `shown` only, always with a three letter
+currency, never converted: `micros_from_revenue` formats the double to 6
+decimals and `micros_from_decimal_string` rounds half up on the digits. A
+malformed call returns false, logs one warning and sends nothing. The events
+are `rs_ad` and `rs_attribution` unless you set `name`.
+
+`set_attribution` takes `source` (`utm`, `store_referrer`, `organic` or a
+partner name), `network`, `campaign`, `adset`, `creative` and
+`touch_time_ms` (epoch milliseconds, 0 to leave it out). A flag file beside
+the storage file (`ravensight_attribution`) stops later calls;
+`reset_device_id` clears it. Pass `device_id(client)` to an attribution
+partner as its customer user id so its install callback names this device.
 
 ## Device id and privacy
 
@@ -458,7 +524,9 @@ lowercase hex characters from the platform's cryptographic random source,
 and saves it, so a returning player counts as returning. It is not derived
 from hardware or an account. No advertising id, IP based fingerprint or
 personal data is collected by the SDK itself; only the events you choose to
-send leave the machine.
+send leave the machine, plus the device fields you pass in `Config`
+(`device_model`, `device_os_version`, `device_gpu`), which go on the session
+when set. Country is never sent by the SDK.
 
 The id and the player's choice live in one small JSON file,
 `{"deviceId": "...", "trackingEnabled": true}`, at
@@ -625,10 +693,15 @@ cache. ETags make unchanged responses free; a fresh response consumes one
 ordinary event. Playtest clients keep config only in memory. Opt-out and
 identity reset clear the current cache and invalidate pending responses.
 
-Accepted experiment assignments automatically add `rs_exp_<key>` to newly
-tracked events, including typed helpers. Existing queued events retain their
-original assignments through retries. Caller-supplied exposure labels are
-removed. Responses are limited to 50 keys, 8 KiB per value, 10 experiments,
+A fetch alone exposes nothing. The first typed read in a session
+(`get_config_string`, `get_config_bool`, `get_config_number`,
+`get_config_json`) marks every running experiment in the config as exposed:
+from then on every event queued carries `rs_exp_<key> = <variant>`, and one
+`rs_exposure` event is sent at that moment. A new launch starts untagged
+until its own first read. An experiment gone from a later fetch is no longer
+tagged. A well-formed `rs_exp_<key>` your game sets itself is left alone; a
+malformed one is replaced. Queued events keep their tags through retries
+and the saved queue. Responses are limited to 50 keys, 8 KiB per value, 10 experiments,
 bounded JSON depth and valid names; malformed responses preserve the prior
 cache. Network response accumulation is capped at 450 KB.
 

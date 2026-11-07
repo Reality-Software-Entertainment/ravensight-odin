@@ -142,28 +142,58 @@ config_value :: proc(cl:^Client,key:string)->json.Value {
  values,_:=doc["values"].(json.Object); return values[key]
 }
 // Strings are borrowed until the next successful config fetch, reset or shutdown.
-get_config_string :: proc(cl:^Client,key:string,fallback:string="")->string { v,ok:=config_value(cl,key).(json.String); return ok ? string(v) : fallback }
-get_config_bool :: proc(cl:^Client,key:string,fallback:bool=false)->bool { v,ok:=config_value(cl,key).(json.Boolean); return ok ? bool(v) : fallback }
+get_config_string :: proc(cl:^Client,key:string,fallback:string="")->string { note_exposure(cl); v,ok:=config_value(cl,key).(json.String); return ok ? string(v) : fallback }
+get_config_bool :: proc(cl:^Client,key:string,fallback:bool=false)->bool { note_exposure(cl); v,ok:=config_value(cl,key).(json.Boolean); return ok ? bool(v) : fallback }
 get_config_number :: proc(cl:^Client,key:string,fallback:f64=0)->f64 {
+ note_exposure(cl)
  #partial switch v in config_value(cl,key) { case json.Integer: return f64(v); case json.Float: return f64(v) }; return fallback
 }
 // JSON text is copied into allocator; caller owns and deletes the returned string.
 get_config_json :: proc(cl:^Client,key:string,fallback:string="null",allocator:=context.allocator)->string {
+ note_exposure(cl)
  v:=config_value(cl,key); if v==nil { return strings.clone(fallback,allocator) }
  result,err:=json.unparse(v,allocator=allocator); if err!=nil { return strings.clone(fallback,allocator) }; return result
 }
+// The experiments in the current config, key to variant (borrowed).
+@(private)
+config_experiments :: proc(cl:^Client) -> [dynamic][2]string {
+ out:=make([dynamic][2]string,context.temp_allocator)
+ doc,has:=cl.remote.document.(json.Object); if !has { return out }
+ assignments,_:=doc["experiments"].(json.Array)
+ for a in assignments {
+  item,_:=a.(json.Object); key,k:=item["key"].(json.String); variant,v:=item["variant"].(json.String)
+  if k && v { append(&out,[2]string{string(key),string(variant)}) }
+ }
+ return out
+}
+// A read is how the game uses a value, so the first typed read in a session
+// marks every running experiment in the config as exposed and sends one
+// rs_exposure event. A fetch alone tags nothing.
+@(private)
+note_exposure :: proc(cl:^Client) {
+ if cl==nil || !core_is_active(&cl.core) { return }
+ newly:=false
+ for e in config_experiments(cl) {
+  if !(e[0] in cl.exposed) { cl.exposed[strings.clone(e[0],cl.allocator)]=true; newly=true }
+ }
+ if newly { track(cl,"rs_exposure") }
+}
+// Tags rs_exp_<key> = <variant> for each exposed experiment still in the
+// config (one that stopped is no longer tagged). A well-formed value the game
+// set itself is left alone; a malformed one is replaced.
 with_config_exposures :: proc(cl:^Client,body:string)->string {
  body := len(body)==0 ? "{}" : body
- if cl.remote.document==nil && !strings.contains(body,"rs_exp_") { return body }
+ if len(cl.exposed)==0 { return body }
  parsed,err:=json.parse(transmute([]u8)body,spec=.JSON,parse_integers=true,allocator=context.temp_allocator)
  if err!=nil { return body }
  obj,ok:=parsed.(json.Object); if !ok { return body }
- // Reserved labels can only come from the current accepted config response.
- for key in obj { if strings.has_prefix(key,"rs_exp_") { delete_key(&obj,key) } }
- doc,has:=cl.remote.document.(json.Object)
- if has {
-  assignments,_:=doc["experiments"].(json.Array)
-  for a in assignments { item,_:=a.(json.Object); key,_:=item["key"].(json.String); obj[strings.concatenate({"rs_exp_",key},context.temp_allocator)]=item["variant"] }
+ changed:=false
+ for e in config_experiments(cl) {
+  if !(e[0] in cl.exposed) { continue }
+  tag:=strings.concatenate({"rs_exp_",e[0]},context.temp_allocator)
+  if current,is_str:=obj[tag].(json.String); is_str && config_name(string(current),40,true) { continue }
+  obj[tag]=json.String(e[1]); changed=true
  }
+ if !changed { return body }
  result,e:=json.unparse(json.Value(obj),allocator=context.temp_allocator); return e==nil ? result : body
 }

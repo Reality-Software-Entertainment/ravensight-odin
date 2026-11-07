@@ -30,12 +30,17 @@ DEFAULT_FLUSH_INTERVAL_MS :: 5_000
 DEFAULT_SESSION_TTL_MS :: 86_400_000
 // A session this close to expiry is treated as already expired.
 EXPIRY_SKEW_MS :: 5_000
-// Consecutive 401-driven re-auths tolerated before backing off, so a server
-// that rejects every fresh token cannot cause a hot request loop.
-MAX_REAUTH_STREAK :: 2
-// Backoff waits are spread by plus or minus this fraction, so many games
-// that failed together do not retry together. Retry-After is never spread.
-BACKOFF_JITTER :: 0.2
+// Consecutive 401-driven re-auths tolerated before backing off: a batch 401
+// opens a new session once, and a second 401 in a row waits for the backoff.
+MAX_REAUTH_STREAK :: 1
+// Backoff waits are multiplied by a random factor of at least this and below
+// 1, so many games that failed together do not retry together. Retry-After
+// is never spread.
+BACKOFF_MIN_FACTOR :: 0.5
+// The saved queue keeps at most this many events across launches.
+QUEUE_MAX_EVENTS :: 500
+// Events older than this are dropped when the saved queue is read.
+QUEUE_MAX_AGE_MS :: 89 * 86_400_000
 // The largest event the API accepts: its data serialized as JSON. Bigger
 // events are dropped before they are queued.
 MAX_EVENT_BYTES :: 8192
@@ -82,9 +87,16 @@ reason_string :: proc(r: Reason) -> string {
 Core_Event :: struct {
 	name:        string, // owned by the core
 	data_json:   string, // owned by the core; pre-serialized JSON object, "" means {}
-	timestamp_s: i64,    // unix seconds, captured when the event happened
+	timestamp_ms: i64,   // unix milliseconds, captured when the event happened
 	is_error:    bool,   // an error event: queued behind gameplay events
 	tag:         int,    // the caller's marker, carried untouched (0 for none)
+	// The origin object of the session it was queued under, as JSON text,
+	// owned; "" when none. Sent with the event when that session is not the
+	// current one.
+	origin_json:  string,
+	// True when the origin is settled (read from the saved queue), so a new
+	// session never adopts the event.
+	origin_fixed: bool,
 }
 
 Request_Kind :: enum {
@@ -117,6 +129,7 @@ Core_Response :: struct {
 	expires_at_ms:        i64,    // session only; absolute unix ms, 0 when absent
 	expires_in_ms:        i64,    // session only; relative ms, 0 when absent
 	error_code:           string, // server "error" field or a fallback; borrowed
+	index:                int,    // batch 400 only: the refused event, -1 when absent
 }
 
 // What happened as a result of a response; the client maps these to the
@@ -140,6 +153,11 @@ Stats :: struct {
 	dropped:  int,
 	flushes:  int,
 	sessions: int,
+	// Of `dropped`: past the queue cap, older than 89 days when the saved
+	// queue was read, and refused by the server.
+	dropped_overflow: int,
+	dropped_too_old:  int,
+	dropped_refused:  int,
 }
 
 Core :: struct {
@@ -181,6 +199,16 @@ Core :: struct {
 	flush_requested:       bool,
 	batch_limit:           int, // MAX_BATCH_SIZE normally, halved on HTTP 400
 	reauth_streak:         int,
+	retry_from_server:     bool, // the running wait is a Retry-After
+	send_plain:            bool, // after a 415: the next batch goes uncompressed
+	queue_dirty:           bool, // the queue changed since the client last saved it
+	// The open session's origin as JSON text (owned), "" when none.
+	session_origin_json:   string,
+	// The tags of events an answer settled for good (delivered or refused),
+	// for the client to drain: error capture removes their crash records.
+	settled_tags:          [dynamic]int,
+	// The last batch went gzip compressed (set by the client).
+	last_batch_compressed: bool,
 
 	stats:                 Stats,
 }
@@ -193,6 +221,7 @@ core_make :: proc(max_queue := DEFAULT_QUEUE_CAP, flush_interval_ms: i64 = DEFAU
 		enabled           = true,
 		tracking_enabled  = true,
 		queue             = make([dynamic]Core_Event, allocator),
+		settled_tags      = make([dynamic]int, allocator),
 		backoff_ms        = DEFAULT_RETRY_MS,
 		batch_limit       = MAX_BATCH_SIZE,
 	}
@@ -201,6 +230,8 @@ core_make :: proc(max_queue := DEFAULT_QUEUE_CAP, flush_interval_ms: i64 = DEFAU
 core_destroy :: proc(c: ^Core) {
 	core_clear_queue(c)
 	delete(c.queue)
+	delete(c.settled_tags)
+	core_set_session_origin(c, "")
 	if len(c.session_token) > 0 {
 		delete(c.session_token, c.allocator)
 		c.session_token = ""
@@ -286,6 +317,97 @@ core_invalidate_session :: proc(c: ^Core) {
 	c.session_expires_at_ms = 0
 	c.session_gen += 1
 	c.reauth_streak = 0
+	core_set_session_origin(c, "")
+}
+
+// Keeps the open session's origin (JSON text, cloned). Events queued while
+// no session was open, and not read from the saved queue, belong to it.
+core_set_session_origin :: proc(c: ^Core, origin_json: string) {
+	if len(c.session_origin_json) > 0 {
+		delete(c.session_origin_json, c.allocator)
+	}
+	c.session_origin_json = len(origin_json) > 0 ? strings.clone(origin_json, c.allocator) : ""
+	if len(origin_json) == 0 {
+		return
+	}
+	for &evt in c.queue {
+		if !evt.origin_fixed && len(evt.origin_json) == 0 {
+			evt.origin_json = strings.clone(origin_json, c.allocator)
+			c.queue_dirty = true
+		}
+	}
+}
+
+@(private)
+core_free_event :: proc(c: ^Core, evt: Core_Event) {
+	delete(evt.name, c.allocator)
+	delete(evt.data_json, c.allocator)
+	if len(evt.origin_json) > 0 {
+		delete(evt.origin_json, c.allocator)
+	}
+}
+
+// The first queued automatic error outside the batch in flight, or -1.
+core_first_automatic :: proc(c: ^Core) -> int {
+	from := c.in_flight == .Batch ? c.in_flight_batch : 0
+	for i in from ..< len(c.queue) {
+		if c.queue[i].is_error {
+			return i
+		}
+	}
+	return -1
+}
+
+core_queue_cap :: proc(c: ^Core) -> int {
+	return clamp(c.max_queue, 1, QUEUE_MAX_EVENTS)
+}
+
+// Puts gameplay events before captured errors, keeping each group's order.
+// Only for a queue with nothing in flight (the saved queue just read).
+core_order_errors_last :: proc(c: ^Core) {
+	if c.in_flight == .Batch {
+		return
+	}
+	ordered := make([dynamic]Core_Event, 0, len(c.queue), c.allocator)
+	for evt in c.queue {
+		if !evt.is_error {
+			append(&ordered, evt)
+		}
+	}
+	for evt in c.queue {
+		if evt.is_error {
+			append(&ordered, evt)
+		}
+	}
+	delete(c.queue)
+	c.queue = ordered
+}
+
+// Removes the event at `i`, counted as dropped past the cap.
+@(private)
+core_evict :: proc(c: ^Core, i: int) {
+	core_free_event(c, c.queue[i])
+	ordered_remove(&c.queue, i)
+	c.stats.dropped += 1
+	c.stats.dropped_overflow += 1
+	c.queue_dirty = true
+}
+
+// Appends an event read from the saved queue (strings cloned): its origin
+// is settled, and the cap applies, automatic errors first.
+core_load_event :: proc(c: ^Core, evt: Core_Event) {
+	append(&c.queue, Core_Event{
+		name         = strings.clone(evt.name, c.allocator),
+		data_json    = strings.clone(evt.data_json, c.allocator),
+		timestamp_ms = evt.timestamp_ms,
+		origin_json  = len(evt.origin_json) > 0 ? strings.clone(evt.origin_json, c.allocator) : "",
+		origin_fixed = true,
+		is_error     = evt.is_error,
+	})
+	for len(c.queue) > core_queue_cap(c) {
+		i := core_first_automatic(c)
+		core_evict(c, i >= 0 ? i : 0)
+	}
 }
 
 // Drops everything queued, counting it as dropped.
@@ -309,9 +431,15 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 		return false
 	}
 
-	// Events in the batch in flight are never moved or dropped here.
+	// Events in the batch in flight are never moved or dropped here: with
+	// nothing outside it to make room, the incoming event is dropped.
 	floor := c.in_flight == .Batch ? min(c.in_flight_batch, len(c.queue)) : 0
-	for len(c.queue) >= c.max_queue {
+	for len(c.queue) >= core_queue_cap(c) {
+		if floor >= len(c.queue) {
+			c.stats.dropped += 1
+			c.stats.dropped_overflow += 1
+			return false
+		}
 		victim := 0
 		for i in floor ..< len(c.queue) {
 			if c.queue[i].is_error {
@@ -322,29 +450,32 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 		if victim == 0 && (floor == len(c.queue) || !c.queue[floor].is_error) {
 			if is_error {
 				c.stats.dropped += 1
+				c.stats.dropped_overflow += 1
 				return false
 			}
 		}
 		if victim == 0 && floor > 0 && floor < len(c.queue) {
 			victim = floor
 		}
-		evt := c.queue[victim]
-		delete(evt.name, c.allocator)
-		delete(evt.data_json, c.allocator)
+		core_free_event(c, c.queue[victim])
 		ordered_remove(&c.queue, victim)
 		if victim < floor {
 			c.in_flight_batch -= 1
 			floor -= 1
 		}
 		c.stats.dropped += 1
+		c.stats.dropped_overflow += 1
 	}
 
 	evt := Core_Event{
-		name        = strings.clone(name, c.allocator),
-		data_json   = strings.clone(data_json, c.allocator),
-		timestamp_s = now_ms / 1000,
-		is_error    = is_error,
-		tag         = tag,
+		name         = strings.clone(name, c.allocator),
+		data_json    = strings.clone(data_json, c.allocator),
+		timestamp_ms = now_ms,
+		is_error     = is_error,
+		tag          = tag,
+		// The session it was queued under; events queued before a session
+		// opens join the next one.
+		origin_json  = len(c.session_origin_json) > 0 ? strings.clone(c.session_origin_json, c.allocator) : "",
 	}
 	at := len(c.queue)
 	if !is_error {
@@ -353,6 +484,7 @@ core_track :: proc(c: ^Core, name: string, data_json: string, now_ms: i64, is_er
 		}
 	}
 	inject_at(&c.queue, at, evt)
+	c.queue_dirty = true
 
 	if c.next_flush_at_ms == 0 && c.flush_interval_ms >= 0 {
 		c.next_flush_at_ms = now_ms + c.flush_interval_ms
@@ -365,11 +497,13 @@ core_request_flush :: proc(c: ^Core) {
 	c.flush_requested = true
 }
 
-// Like core_request_flush but also clears any backoff gate. Used at
-// shutdown for the final best-effort flush.
+// Like core_request_flush but also cuts a backoff wait short. A server's
+// Retry-After wait always holds. Used at shutdown for the final flush.
 core_force_flush :: proc(c: ^Core) {
 	c.flush_requested = true
-	c.next_attempt_at_ms = 0
+	if !c.retry_from_server {
+		c.next_attempt_at_ms = 0
+	}
 }
 
 // Marks that something outside the queue (a feedback submission) needs a
@@ -419,7 +553,7 @@ core_next :: proc(c: ^Core, now_ms: i64) -> (req: Core_Request, ok: bool) {
 	}
 
 	n := min(c.batch_limit, len(c.queue))
-	body := build_batch_body(c.queue[:n], c.allocator)
+	body := build_batch_body(c.queue[:n], c.allocator, c.session_origin_json)
 	c.in_flight = .Batch
 	c.in_flight_batch = n
 	c.in_flight_queue_gen = c.queue_gen
@@ -516,14 +650,13 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			return
 		}
 
+		if res.status != 413 && res.status != 415 {
+			c.send_plain = false
+		}
 		switch {
-		case res.status == 202:
+		case res.status >= 200 && res.status < 300:
 			remove := min(n, len(c.queue))
-			for i in 0 ..< remove {
-				delete(c.queue[i].name, c.allocator)
-				delete(c.queue[i].data_json, c.allocator)
-			}
-			remove_range(&c.queue, 0, remove)
+			core_remove_front(c, remove)
 			c.stats.sent += remove
 			c.stats.flushes += 1
 			c.batch_limit = MAX_BATCH_SIZE
@@ -539,8 +672,9 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			}
 			sig.events_flushed = remove
 		case res.status == 401:
-			// Session expired or revoked. The batch stays queued and is
-			// re-sent as soon as a fresh session is issued.
+			// Session expired, revoked, or a signature refused. The batch
+			// stays queued and is re-sent under a fresh session, once; a
+			// second 401 in a row waits for the backoff.
 			if len(c.session_token) > 0 {
 				delete(c.session_token, c.allocator)
 				c.session_token = ""
@@ -548,8 +682,6 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			c.session_expires_at_ms = 0
 			c.reauth_streak += 1
 			if c.reauth_streak > MAX_REAUTH_STREAK {
-				// The server rejects even freshly issued tokens; stop the
-				// hot re-auth loop and retry later.
 				core_schedule_backoff(c, now_ms)
 			}
 			c.flush_requested = true
@@ -562,25 +694,8 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 			c.last_failure = .Rate_Limited
 			sig.flush_failed = true
 			sig.reason = "rate_limited"
-		case res.status == 400 || res.status == 413:
-			// 413 is the same answer as 400: too big, so split; never resent as is.
-			if n > 1 {
-				// Batch rejected as oversize: halve and retry immediately.
-				c.batch_limit = max(1, n / 2)
-				c.flush_requested = true
-			} else {
-				// A single event the server will never take. Drop it so the
-				// rest of the queue is not blocked behind it forever.
-				if len(c.queue) > 0 {
-					delete(c.queue[0].name, c.allocator)
-					delete(c.queue[0].data_json, c.allocator)
-					ordered_remove(&c.queue, 0)
-					c.stats.dropped += 1
-				}
-				c.batch_limit = MAX_BATCH_SIZE
-				c.flush_requested = len(c.queue) > 0
-				sig.event_dropped = true
-			}
+		case res.status == 400 || res.status == 413 || res.status == 415:
+			core_on_batch_refused(c, res, n, &sig)
 		case res.status == 0:
 			core_schedule_backoff(c, now_ms)
 			c.last_failure = .Offline
@@ -595,6 +710,68 @@ core_on_response :: proc(c: ^Core, res: Core_Response, now_ms: i64) -> (sig: Sig
 		}
 	}
 	return
+}
+
+
+// Removes the first `count` queued events.
+@(private)
+core_remove_front :: proc(c: ^Core, count: int) {
+	n := min(count, len(c.queue))
+	for i in 0 ..< n {
+		if c.queue[i].tag != 0 {
+			append(&c.settled_tags, c.queue[i].tag)
+		}
+		core_free_event(c, c.queue[i])
+	}
+	remove_range(&c.queue, 0, n)
+	c.queue_dirty = true
+}
+
+// A 400, 413 or 415 for the `n` events at the queue's front:
+//   a 400 naming an event by index drops that event, the rest are resent;
+//   batch_too_large or a 413 halves the batch;
+//   a 415 (or a 413 for one event) is resent uncompressed once, then dropped;
+//   any other 400 drops the request's events (only batch_too_large and a
+//   413 halve a batch).
+@(private)
+core_on_batch_refused :: proc(c: ^Core, res: Core_Response, n: int, sig: ^Signals) {
+	drop :: proc(c: ^Core, count: int, sig: ^Signals) {
+		dropped := min(count, len(c.queue))
+		core_remove_front(c, dropped)
+		c.stats.dropped += dropped
+		c.stats.dropped_refused += dropped
+		c.batch_limit = MAX_BATCH_SIZE
+		sig.event_dropped = true
+	}
+	defer c.flush_requested = len(c.queue) > 0
+	if res.status == 400 && res.index >= 0 && res.index < n && res.index < len(c.queue) {
+		if c.queue[res.index].tag != 0 {
+			append(&c.settled_tags, c.queue[res.index].tag)
+		}
+		core_free_event(c, c.queue[res.index])
+		ordered_remove(&c.queue, res.index)
+		c.queue_dirty = true
+		c.stats.dropped += 1
+		c.stats.dropped_refused += 1
+		c.batch_limit = MAX_BATCH_SIZE
+		sig.event_dropped = true
+		return
+	}
+	if res.status == 415 || (res.status == 413 && n <= 1) {
+		// A 413 for one event that went uncompressed is never retried as is.
+		if !c.send_plain && (res.status == 415 || c.last_batch_compressed) {
+			c.send_plain = true
+			return
+		}
+		c.send_plain = false
+		drop(c, n, sig)
+		return
+	}
+	if (res.status == 413 || res.error_code == "batch_too_large") && n > 1 {
+		c.batch_limit = max(1, n / 2)
+		return
+	}
+	drop(c, n, sig)
 }
 
 // Applies a 401 or 403 from any endpoint (except a 401 on a batch, which
@@ -641,16 +818,17 @@ core_reset_backoff :: proc(c: ^Core) {
 	c.next_attempt_at_ms = 0
 }
 
-// Opens a retry window of the current backoff, spread by plus or minus
-// BACKOFF_JITTER when a random source is set (never past the ceiling), then
-// doubles the backoff up to the ceiling.
+// Opens a retry window of the current backoff, multiplied by a random factor
+// from BACKOFF_MIN_FACTOR up to 1 when a random source is set, then doubles
+// the backoff up to the ceiling.
 core_schedule_backoff :: proc(c: ^Core, now_ms: i64) {
-	wait := c.backoff_ms
+	wait := min(c.backoff_ms, MAX_BACKOFF_MS)
 	if c.random != nil {
 		draw := clamp(c.random(), 0, 1)
-		factor := 1 - BACKOFF_JITTER + 2 * BACKOFF_JITTER * draw
-		wait = min(i64(f64(c.backoff_ms) * factor), MAX_BACKOFF_MS)
+		factor := BACKOFF_MIN_FACTOR + (1 - BACKOFF_MIN_FACTOR) * draw
+		wait = i64(f64(wait) * factor)
 	}
+	c.retry_from_server = false
 	c.next_attempt_at_ms = now_ms + wait
 	c.backoff_ms = min(c.backoff_ms * 2, MAX_BACKOFF_MS)
 }
@@ -661,6 +839,7 @@ core_schedule_backoff :: proc(c: ^Core, now_ms: i64) {
 core_apply_retry_after :: proc(c: ^Core, res: Core_Response, now_ms: i64) {
 	if res.retry_after_ms > 0 {
 		c.next_attempt_at_ms = now_ms + res.retry_after_ms
+		c.retry_from_server = true
 	} else {
 		core_schedule_backoff(c, now_ms)
 	}
@@ -668,10 +847,10 @@ core_apply_retry_after :: proc(c: ^Core, res: Core_Response, now_ms: i64) {
 
 core_clear_queue :: proc(c: ^Core) {
 	for evt in c.queue {
-		delete(evt.name, c.allocator)
-		delete(evt.data_json, c.allocator)
+		core_free_event(c, evt)
 	}
 	clear(&c.queue)
+	c.queue_dirty = true
 	c.queue_gen += 1
 	c.flush_requested = false
 	c.next_flush_at_ms = 0
@@ -681,10 +860,11 @@ core_clear_queue :: proc(c: ^Core) {
 // --- Wire format --------------------------------------------------------------
 
 // Builds the exact JSON body for POST /track/batch:
-//   {"events":[{"event":"...","data":{...},"timestamp":123}, ...]}
+//   {"events":[{"event":"...","data":{...},"timestamp":1700000000123}, ...]}
 // Event names are escaped; data_json is spliced in verbatim (it was
-// serialized by the client layer already).
-build_batch_body :: proc(events: []Core_Event, allocator := context.allocator) -> string {
+// serialized by the client layer already). An event queued under another
+// session than `current_origin` carries that session's origin, verbatim.
+build_batch_body :: proc(events: []Core_Event, allocator := context.allocator, current_origin := "") -> string {
 	b := strings.builder_make(allocator)
 	strings.write_string(&b, `{"events":[`)
 	for evt, i in events {
@@ -696,7 +876,11 @@ build_batch_body :: proc(events: []Core_Event, allocator := context.allocator) -
 		strings.write_string(&b, `,"data":`)
 		strings.write_string(&b, len(evt.data_json) > 0 ? evt.data_json : "{}")
 		strings.write_string(&b, `,"timestamp":`)
-		strings.write_i64(&b, evt.timestamp_s)
+		strings.write_i64(&b, evt.timestamp_ms)
+		if len(evt.origin_json) > 0 && evt.origin_json != current_origin {
+			strings.write_string(&b, `,"origin":`)
+			strings.write_string(&b, evt.origin_json)
+		}
 		strings.write_byte(&b, '}')
 	}
 	strings.write_string(&b, `]}`)
