@@ -16,7 +16,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
-VERSION :: "0.5.0"
+VERSION :: "0.6.0"
 DEFAULT_API_URL :: "https://api.ravensight.io"
 DEFAULT_REQUEST_TIMEOUT_MS :: 15_000
 // shutdown() holds the quit for at most this long by default.

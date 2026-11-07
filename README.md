@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.5.0. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.6.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -425,7 +425,7 @@ and none of these options.
 | --- | --- | --- | --- |
 | 0.2.0 | `dev-2026-08`, libcurl | `/api/v1` | The shared SDK contract. |
 | 0.3.0 | `dev-2026-08`, libcurl | `/api/v1` | Public builds. `gt_pub_` keys, the `distribution` field and recognising a resent `rs_event_id` need the API's public key support; an API without it ignores `distribution` and stores `rs_event_id` as an ordinary property. |
-| Unreleased | `dev-2026-08`, libcurl, the system zlib on macOS and Linux | `/api/v1` | Saved queue with origins, gzip, signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
+| 0.6.0 | `dev-2026-08`, libcurl, the system zlib on macOS and Linux | `/api/v1` | Saved queue with origins, gzip, signing, ads and attribution, exposure tagging, device fields. Needs a Ravensight server that accepts `origin`, gzip and signatures, and knows the `rs_ad_*` and `rs_attr_*` keys. |
 
 ## About your ingest key
 
