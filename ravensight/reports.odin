@@ -5,6 +5,9 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:time"
+// The storage host the API signs uploads for; moves to files.ravensight.io.
+REPORT_STORAGE_HOST_SUFFIX :: ".amazonaws.com"
+REPORT_STORAGE_HOST_MARK :: ".s3"
 
 Report_Input :: struct {
  client_id, message: string,
@@ -84,13 +87,10 @@ report_response :: proc(cl:^Client,t:^Transfer,status:int) {
  obj,is:=parsed.(json.Object);if !is {report_done(r,"","invalid_response");return}
  if t.report_stage==.Grant {
   url:=report_string(obj,"url")
-  // Dedicated HTTPS storage grants on a DNS name only (never localhost, a port,
-  // user info or an IP literal); never send session/ingest/playtest credentials.
+  // Dedicated HTTPS storage grants only; never send session/ingest/playtest credentials.
   if !strings.has_prefix(url,"https://") {report_done(r,"","invalid_upload");return}
   host:=strings.trim_suffix(url[8:],"/")
-  if !strings.contains(host,".") || strings.has_prefix(host,".") || strings.has_suffix(host,".") {report_done(r,"","invalid_upload");return}
-  numeric:=true;for c in host {if !(c>='0'&&c<='9'||c=='.'){numeric=false;break}}
-  if numeric {report_done(r,"","invalid_upload");return}
+  if !strings.has_suffix(host,REPORT_STORAGE_HOST_SUFFIX) || !strings.contains(host,REPORT_STORAGE_HOST_MARK) {report_done(r,"","invalid_upload");return}
   for c in host {if !(c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='-'||c=='.'){report_done(r,"","invalid_upload");return}}
   value,has:=obj["fields"];fields,object:=value.(json.Object)
   if !has || !object || len(fields)==0 || len(fields)>30 {report_done(r,"","invalid_upload");return}
