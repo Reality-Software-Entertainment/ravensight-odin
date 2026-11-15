@@ -3,6 +3,10 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.6.1] - 2026-11-15
+
+Public text no longer names the infrastructure behind the service. The upload host check is unchanged in what it accepts, and now also refuses an address with an explicit port. No API or behaviour change for games.
+
 ## [0.6.0] - 2026-11-06
 
 Needs a Ravensight server that accepts origins, signatures, gzip bodies,
