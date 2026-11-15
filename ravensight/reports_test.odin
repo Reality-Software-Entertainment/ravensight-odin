@@ -22,7 +22,7 @@ test_report_upload_binary_session_and_replay :: proc(t:^testing.T) {
  testing.expect(t,submit_report(cl,r,report_record,&recorded));testing.expect(t,!submit_report(cl,r,report_record,&recorded));testing.expect(t,!destroy_report(r))
  idx:=open_request(&f);testing.expect(t,has_header(f.requests[idx],"X-Session-Token: tok_1"))
  answer_next(t,&f,"/reports",201,`{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","status":"pending"}`)
- answer_next(t,&f,"/reports/aaaaaaaaaaaaaaaaaaaaaaaa/upload",200,`{"url":"https://fixture.s3.us-east-1.amazonaws.com/","fields":{"key":"fixture","Policy":"signed"}}`)
+ answer_next(t,&f,"/reports/aaaaaaaaaaaaaaaaaaaaaaaa/upload",200,`{"url":"https://uploads.example.com/","fields":{"key":"fixture","Policy":"signed"}}`)
  idx=open_request(&f);upload:=f.requests[idx]
  testing.expect(t,strings.contains(upload.body,REPORT_TEST_PNG));testing.expect(t,!has_header(upload,"X-Session-Token: tok_1"));testing.expect(t,len(upload.headers)==1)
  answer(&f,idx,204)
@@ -41,7 +41,7 @@ test_report_ambiguous_retry_and_session_fence :: proc(t:^testing.T) {
  r,_:=create_report(Report_Input{client_id="fixture-002",message="Bug",png=transmute([]u8)string(REPORT_TEST_PNG),consent=true});defer destroy_report(r)
  recorded:Report_Recorded;submit_report(cl,r,report_record,&recorded)
  answer_next(t,&f,"/reports",201,`{"id":"aaaaaaaaaaaaaaaaaaaaaaaa","status":"pending"}`)
- answer_next(t,&f,"/reports/aaaaaaaaaaaaaaaaaaaaaaaa/upload",200,`{"url":"https://fixture.s3.amazonaws.com/","fields":{"key":"fixture"}}`)
+ answer_next(t,&f,"/reports/aaaaaaaaaaaaaaaaaaaaaaaa/upload",200,`{"url":"https://uploads.example.com/","fields":{"key":"fixture"}}`)
  answer(&f,open_request(&f),0)
  testing.expect(t,!r.pending && !r.uploaded)
  testing.expect(t,submit_report(cl,r,report_record,&recorded))
@@ -52,7 +52,7 @@ test_report_ambiguous_retry_and_session_fence :: proc(t:^testing.T) {
 }
 @(test)
 test_report_refuses_foreign_upload_and_control_injection :: proc(t:^testing.T) {
- for grant in ([]string{`{"url":"https://localhost/","fields":{"key":"x"}}`,`{"url":"https://fixture.s3.amazonaws.com@evil.test/","fields":{"key":"x"}}`,`{"url":"https://fixture.s3.amazonaws.com/","fields":{"file":"x"}}`,`{"url":"https://fixture.s3.amazonaws.com/","fields":{"key":"a\r\nheader"}}`}) {
+ for grant in ([]string{`{"url":"https://localhost/","fields":{"key":"x"}}`,`{"url":"https://127.0.0.1/","fields":{"key":"x"}}`,`{"url":"https://uploads.example.com:8443/","fields":{"key":"x"}}`,`{"url":"http://uploads.example.com/","fields":{"key":"x"}}`,`{"url":"https://uploads.example.com@evil.test/","fields":{"key":"x"}}`,`{"url":"https://uploads.example.com/","fields":{"file":"x"}}`,`{"url":"https://uploads.example.com/","fields":{"key":"a\r\nheader"}}`}) {
   f:Fake;fake_init(&f)
   cl:=fake_client(t,&f,Config{disable_lifecycle_events=true});core_want_session(&cl.core);boot_client(t,&f,cl)
   r,_:=create_report(Report_Input{client_id="fixture-003",message="Bug",png=transmute([]u8)string(REPORT_TEST_PNG),consent=true})

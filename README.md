@@ -724,7 +724,7 @@ visible; reuse the same prepared object in `submit_report` to poll or retry.
 The stable report/session binding prevents retries from becoming new reports.
 A changed session or opted-out player refuses submission. There are no automatic
 retries, screen captures, disk queues or added player analytics events. Existing
-Player Report pricing applies. Signed S3 uploads have their own HTTPS request,
+Player Report pricing applies. Signed storage uploads have their own HTTPS request,
 with no ingest/session/playtest credentials; multipart files are binary-length
 counted (including NUL bytes), redirects are not enabled, and response bodies
 are bounded to 64 KiB. Host callbacks should not destroy the SDK client while

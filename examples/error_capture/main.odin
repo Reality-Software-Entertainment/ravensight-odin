@@ -1,8 +1,8 @@
 // Error capture sample: the one host line, a logged error, and a failed
 // assertion that is sent on the next launch.
 //
-// It talks to a local API only (http://localhost:3000 unless you pass
-// -define:RAVENSIGHT_API=...), and does nothing without a key:
+// It uses the hosted API unless you pass -define:RAVENSIGHT_API=..., and
+// does nothing without a key:
 //
 //   odin run examples/error_capture -define:RAVENSIGHT_KEY=gt_live_dev_key
 //   odin run examples/error_capture -define:RAVENSIGHT_KEY=gt_live_dev_key -- crash
@@ -15,7 +15,7 @@ import "core:time"
 import rs "../../ravensight"
 
 RAVENSIGHT_KEY :: #config(RAVENSIGHT_KEY, "")
-RAVENSIGHT_API :: #config(RAVENSIGHT_API, "http://localhost:3000")
+RAVENSIGHT_API :: #config(RAVENSIGHT_API, "")
 
 main :: proc() {
 	// The game's own logger, as it was before Ravensight.
