@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.6.0. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.6.1. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -724,7 +724,7 @@ visible; reuse the same prepared object in `submit_report` to poll or retry.
 The stable report/session binding prevents retries from becoming new reports.
 A changed session or opted-out player refuses submission. There are no automatic
 retries, screen captures, disk queues or added player analytics events. Existing
-Player Report pricing applies. Signed S3 uploads have their own HTTPS request,
+Player Report pricing applies. Signed storage uploads have their own HTTPS request,
 with no ingest/session/playtest credentials; multipart files are binary-length
 counted (including NUL bytes), redirects are not enabled, and response bodies
 are bounded to 64 KiB. Host callbacks should not destroy the SDK client while
