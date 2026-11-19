@@ -65,7 +65,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   echo "pre-push: running this repository's checks (limit ${LIMIT_SECONDS}s)."
-  if (cd "$root" && run_checks) </dev/null; then
+  # git exports GIT_DIR and friends to hooks; a test that builds a sandbox repo would inherit
+  # them and act on this repository instead, so the checks run without them.
+  if (unset $(git rev-parse --local-env-vars); cd "$root" && run_checks) </dev/null; then
     mkdir -p "$stamps" && date -u +%Y-%m-%dT%H:%M:%SZ > "$stamps/$tree"
     checked=$tree
   else
