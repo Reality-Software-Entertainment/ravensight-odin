@@ -283,6 +283,25 @@ test_campaign_link_set_while_a_session_is_in_flight_waits_for_the_next_session :
 	close_client(cl)
 }
 
+@(test)
+test_campaign_link_the_same_link_set_again_while_in_flight_goes_once :: proc(t: ^testing.T) {
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := Link_Server{hold_sessions = true, batch_401s = 1}
+	cl := fake_client(t, &f, Config{})
+	testing.expect(t, set_campaign_link(cl, LINK))
+	send_one(&f, cl, &s)
+	testing.expect_value(t, count_requests(&f, "/session"), 1)
+	// Changed and changed back while the open session already carries it.
+	testing.expect(t, set_campaign_link(cl, OTHER))
+	testing.expect(t, set_campaign_link(cl, "64B0000000000000000000A1"))
+	s.hold_sessions = false
+	serve_links(&f, cl, &s)
+	expect_links(t, &f, {LINK, ""})
+	close_client(cl)
+}
+
 // --- Gates ------------------------------------------------------------------------------
 
 @(test)

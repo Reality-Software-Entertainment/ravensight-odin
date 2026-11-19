@@ -257,6 +257,10 @@ Client :: struct {
 	warned_identify:      bool,
 	identify_no_session_streak:  int,  // no_session answers in a row
 	identify_no_session_stopped: bool, // two in a row: stopped until reset_identity
+	// Campaign links (campaign_link.odin), memory only.
+	campaign_link:           string, // owned; a link id waiting for the next session, "" when none
+	campaign_link_in_flight: bool,   // the session request in flight carries campaign_link_sent
+	campaign_link_sent:      [24]u8, // the link that request carries
 }
 
 @(private)
@@ -1006,6 +1010,7 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	delete(client.identity_held)
 	delete(client.launch_salt)
 	delete(client.identified_session)
+	delete(client.campaign_link)
 	clear_signing(client)
 	clear_exposed(client)
 	delete(client.exposed)
@@ -1304,6 +1309,7 @@ start_next_protocol_request :: proc(client: ^Client) {
 			strings.write_string(&b, `,"device":`)
 			strings.write_string(&b, client.device_json)
 		}
+		campaign_link_write(client, &b)
 		strings.write_string(&b, `,"sdk":"odin/` + VERSION + `"`)
 		strings.write_byte(&b, '}')
 		t = start_request(client, "/session", strings.to_string(b), .API_Key)
@@ -1470,6 +1476,7 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 				res.expires_in_ms = json_number_i64(v) * 1000
 			}
 		}
+		campaign_link_answer(client, status, res.token)
 	case .Batch:
 		if is_obj && status == 400 {
 			#partial switch v in obj["index"] {
