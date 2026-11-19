@@ -153,6 +153,7 @@ Side_Kind :: enum {
 	Config,
 	Feedback,
 	Suggestions,
+	Identify,
 }
 
 Transfer :: struct {
@@ -168,6 +169,7 @@ Transfer :: struct {
 	url:      cstring, // owned; must outlive the transfer
 	ctx:      runtime.Context,
 	feedback: Pending_Feedback, // feedback transfers keep their body for one re-send
+	identify_generation: int, // identify transfers: the identity they were sent for
 }
 
 @(private)
@@ -243,6 +245,16 @@ Client :: struct {
 	clock_offset_s:     i64,    // serverTime minus the device clock at the session answer
 	queue_loaded:       bool,   // the saved queue was read
 	exposed:            map[string]bool, // experiments this session used
+	// Identify (identify.odin). Strings owned, "" when unset.
+	identity_salt:        string, // the stored identity's salt
+	identity_hash:        string, // the stored accountHash
+	identity_held:        string, // a valid account id waiting for a salt or consent, memory only
+	launch_salt:          string, // the salt this launch's session answer carried
+	launch_salt_missing:  bool,   // a session answer carried none: unavailable this launch
+	identify_stopped:     bool,   // a 404 or invalid hash answer: not sent again this launch
+	identified_session:   string, // the session token identify was last sent under
+	identify_generation:  int,    // bumped by reset_identity and opt-out
+	warned_identify:      bool,
 }
 
 @(private)
@@ -358,12 +370,16 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 			log(cl, .Warning, "Ravensight: the storage file exists but could not be read; tracking is off for this run and the file was left as it is.")
 		} else if len(saved.device_id) > 0 {
 			cl.saved_device_id = saved.device_id
+			cl.identity_salt = saved.identity_salt
+			cl.identity_hash = saved.identity_hash
 		} else if cl.consent == .Opt_In && cl.core.opted_out {
 			// No yes yet: no device id is made or saved until there is one.
 			cl.saved_device_id = strings.clone("")
 		} else {
 			cl.saved_device_id = generate_device_id(allocator)
-			if !save_identity(cl.storage_path, Saved_Identity{device_id = cl.saved_device_id, tracking_enabled = saved.tracking_enabled, opted_in = saved.opted_in}) {
+			cl.identity_salt = saved.identity_salt
+			cl.identity_hash = saved.identity_hash
+			if !save_identity(cl.storage_path, Saved_Identity{device_id = cl.saved_device_id, tracking_enabled = saved.tracking_enabled, opted_in = saved.opted_in, identity_salt = cl.identity_salt, identity_hash = cl.identity_hash}) {
 				log(cl, .Warning, "Ravensight: could not save the device id; players will count as new each launch. Set Config.storage_path to a writable file.")
 			}
 		}
@@ -381,6 +397,8 @@ create_with_transport :: proc(config: Config, transport: Transport, read_process
 	if bind_capture {
 		capture_bind(cl)
 	}
+	// A stored identity is sent in the first session even with no events.
+	identify_if_due(cl, want_session = true)
 	cl.last_reason = core_reason(&cl.core)
 	return cl, .None
 }
@@ -410,6 +428,9 @@ create_inert :: proc(config: Config, transport: Transport, allocator: runtime.Al
 	cl.core.opted_out = !saved_choice(saved, cl.consent)
 	cl.saved_device_id = saved.device_id
 	cl.device_id = strings.clone(saved.device_id)
+	// Inert: an identity is only ever held in memory.
+	delete(saved.identity_salt)
+	delete(saved.identity_hash)
 	cl.distribution = strings.clone("")
 	cl.event_nonce = strings.clone("")
 	cl.last_reason = core_reason(&cl.core)
@@ -567,6 +588,7 @@ set_enabled :: proc(client: ^Client, enabled: bool) {
 		load_config_cache(client)
 		if core_is_session_valid(&client.core, client_now(client)) { fetch_config(client) }
 		maybe_queue_game_started(client)
+		identify_if_due(client, want_session = false)
 	} else {
 		drop_pending_feedback(client, "disabled")
 	}
@@ -602,7 +624,11 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 	if client.consent == .Opt_In || !enabled {
 		client.saved_opt_in = enabled
 	}
-	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled, opted_in = client.saved_opt_in}) {
+	if !enabled {
+		// Opting out (or withdrawing consent) forgets the identity.
+		identify_forget(client, save = false)
+	}
+	if !save_identity(client.storage_path, Saved_Identity{device_id = client.saved_device_id, tracking_enabled = enabled, opted_in = client.saved_opt_in, identity_salt = client.identity_salt, identity_hash = client.identity_hash}) {
 		log(client, .Warning, "Ravensight: could not save the analytics choice to the storage file.")
 	}
 	if !enabled {
@@ -615,6 +641,7 @@ set_tracking_enabled :: proc(client: ^Client, enabled: bool) {
 		load_config_cache(client)
 		if core_is_session_valid(&client.core, client_now(client)) { fetch_config(client) }
 		maybe_queue_game_started(client)
+		identify_if_due(client, want_session = true)
 	} else {
 		drop_pending_feedback(client, "disabled")
 		capture_remove_crash_files(client)
@@ -675,7 +702,8 @@ reset_device_id :: proc(client: ^Client) -> string {
 	delete(client.device_id)
 	client.saved_device_id = fresh
 	client.device_id = strings.clone(fresh)
-	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out, opted_in = client.saved_opt_in}) {
+	// A new device keeps the identity (reset_identity forgets it first).
+	if !save_identity(client.storage_path, Saved_Identity{device_id = fresh, tracking_enabled = !client.core.opted_out, opted_in = client.saved_opt_in, identity_salt = client.identity_salt, identity_hash = client.identity_hash}) {
 		log(client, .Warning, "Ravensight: could not save the new device id to the storage file.")
 	}
 	capture_reset(client)
@@ -971,6 +999,11 @@ shutdown :: proc(client: ^Client, flush_timeout_ms: i64 = QUIT_FLUSH_TIMEOUT_MS)
 	delete(client.playtest.job_id)
 	delete(client.playtest.persona)
 	delete(client.device_json)
+	delete(client.identity_salt)
+	delete(client.identity_hash)
+	delete(client.identity_held)
+	delete(client.launch_salt)
+	delete(client.identified_session)
 	clear_signing(client)
 	clear_exposed(client)
 	delete(client.exposed)
@@ -1459,6 +1492,9 @@ handle_protocol_response :: proc(client: ^Client, t: ^Transfer, status: int, ret
 	clear(&client.core.settled_tags)
 	if t.kind == .Session && sig.session_ready && is_obj {
 		adopt_session_extras(client, obj)
+		if len(client.playtest.token) == 0 {
+			identify_session_answer(client, obj)
+		}
 	}
 	persist_queue(client)
 	dispatch(client, sig)
@@ -1479,6 +1515,8 @@ handle_side_response :: proc(client: ^Client, t: ^Transfer, status: int) {
 	switch t.side {
  case .Report:
 	case .Config:
+	case .Identify:
+		identify_response(client, t, status, code)
 	case .Feedback:
 		if status == 201 {
 			if client.cb.on_feedback_submitted != nil {
@@ -1573,6 +1611,7 @@ dispatch :: proc(client: ^Client, sig: Signals) {
 			client.cb.on_session_ready(client.cb.user)
 		}
 		send_pending_feedback(client)
+		identify_if_due(client, want_session = false)
 	}
 	if sig.session_failed && client.cb.on_session_failed != nil {
 		client.cb.on_session_failed(client.cb.user, sig.reason)
