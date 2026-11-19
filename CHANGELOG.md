@@ -25,9 +25,14 @@ Needs a Ravensight server that offers identify (the session answer carries
   `reset_device_id` alone keeps it. Opting out (`set_tracking_enabled` or
   `write_tracking_enabled` with false) deletes it.
 - Answers: 200 is done for the session; 404 and `invalid_account_hash` stop
-  identify for the launch; every other answer, offline included, waits for
-  the next session. No retry loop. Identify never enters the event queue or
-  the queue file.
+  identify for the launch, and a second `no_session` in a row stops it until
+  `reset_identity`; every other answer, offline included, waits for the next
+  session. No retry loop. Identify never enters the event queue or the queue
+  file, never opens a session while a Retry-After or backoff holds sending,
+  and never changes the delivery stats.
+- Called before this launch's salt is known, the id is held and hashed under
+  the salt the session answer brings, even when it matches the stored
+  identity; the last call before the salt wins.
 
 ## [0.6.1] - 2026-11-15
 

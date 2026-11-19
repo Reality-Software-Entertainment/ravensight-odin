@@ -68,10 +68,17 @@ identify :: proc(client: ^Client, account_id: string) -> bool {
 	if len(client.playtest.token) > 0 {
 		return true
 	}
-	if identify_is_same(client, account_id) {
+	same_held := len(client.identity_held) > 0 && client.identity_held == account_id
+	same_stored := len(client.identity_hash) > 0 && identify_account_hash(account_id, client.identity_salt, context.temp_allocator) == client.identity_hash
+	if same_held {
 		return true
 	}
-	if is_identified(client) {
+	// Before this launch's salt is known the id is held even when it matches
+	// the stored identity: the salt that arrives may differ.
+	if same_stored && len(client.launch_salt) > 0 {
+		return true
+	}
+	if !same_stored && is_identified(client) {
 		reset_identity(client)
 	}
 	if client.launch_salt_missing {
@@ -109,17 +116,6 @@ is_identified :: proc(client: ^Client) -> bool {
 		return false
 	}
 	return len(client.identity_hash) > 0 || len(client.identity_held) > 0
-}
-
-@(private)
-identify_is_same :: proc(client: ^Client, account_id: string) -> bool {
-	if len(client.identity_held) > 0 && client.identity_held == account_id {
-		return true
-	}
-	if len(client.identity_hash) > 0 {
-		return identify_account_hash(account_id, client.identity_salt, context.temp_allocator) == client.identity_hash
-	}
-	return false
 }
 
 @(private)
@@ -172,6 +168,8 @@ identify_forget :: proc(client: ^Client, save: bool) -> bool {
 	client.identity_held = ""
 	delete(client.identified_session)
 	client.identified_session = ""
+	client.identify_no_session_streak = 0
+	client.identify_no_session_stopped = false
 	client.identify_generation += 1
 	return had
 }
@@ -208,7 +206,7 @@ identify_session_answer :: proc(client: ^Client, obj: json.Object) {
 // current session (or asks for a session when `want_session`). Never touches
 // the event queue.
 @(private)
-identify_if_due :: proc(client: ^Client, want_session: bool) {
+identify_if_due :: proc(client: ^Client, want_session: bool, fresh_token := "") {
 	if client.core.inert || len(client.playtest.token) > 0 || !core_is_active(&client.core) {
 		return
 	}
@@ -221,16 +219,23 @@ identify_if_due :: proc(client: ^Client, want_session: bool) {
 		delete(client.identity_held)
 		client.identity_held = ""
 	}
-	if client.identify_stopped || client.launch_salt_missing || !is_identified(client) {
+	if client.identify_stopped || client.identify_no_session_stopped || client.launch_salt_missing || !is_identified(client) {
 		return
 	}
-	if !core_is_session_valid(&client.core, client_now(client)) || len(client.launch_salt) == 0 || len(client.identity_hash) == 0 {
-		if want_session {
+	// The token a session answer just returned is used as is, whatever the
+	// device clock says about its expiry.
+	token := fresh_token
+	if len(token) == 0 && core_is_session_valid(&client.core, client_now(client)) {
+		token = client.core.session_token
+	}
+	if len(token) == 0 || len(client.launch_salt) == 0 || len(client.identity_hash) == 0 {
+		// Never during a Retry-After or backoff: the next ordinary session
+		// carries the identify instead.
+		if want_session && client_now(client) >= client.core.next_attempt_at_ms {
 			core_want_session(&client.core)
 		}
 		return
 	}
-	token := client.core.session_token
 	if client.identified_session == token {
 		return
 	}
@@ -255,6 +260,17 @@ identify_response :: proc(client: ^Client, t: ^Transfer, status: int, code: stri
 	if t.identify_generation != client.identify_generation {
 		log(client, .Info, "Ravensight: ignored an identify answer that no longer applies.")
 		return
+	}
+	if status == 400 && code == "no_session" {
+		// Identify again after the next session opens, once.
+		client.identify_no_session_streak += 1
+		if client.identify_no_session_streak >= 2 {
+			client.identify_no_session_stopped = true
+			log(client, .Info, "Ravensight: identify answered no_session twice in a row; not sent again until a sign-out.")
+			return
+		}
+	} else {
+		client.identify_no_session_streak = 0
 	}
 	switch {
 	case status >= 200 && status < 300:

@@ -255,6 +255,8 @@ Client :: struct {
 	identified_session:   string, // the session token identify was last sent under
 	identify_generation:  int,    // bumped by reset_identity and opt-out
 	warned_identify:      bool,
+	identify_no_session_streak:  int,  // no_session answers in a row
+	identify_no_session_stopped: bool, // two in a row: stopped until reset_identity
 }
 
 @(private)
@@ -1611,7 +1613,7 @@ dispatch :: proc(client: ^Client, sig: Signals) {
 			client.cb.on_session_ready(client.cb.user)
 		}
 		send_pending_feedback(client)
-		identify_if_due(client, want_session = false)
+		identify_if_due(client, want_session = false, fresh_token = client.core.session_token)
 	}
 	if sig.session_failed && client.cb.on_session_failed != nil {
 		client.cb.on_session_failed(client.cb.user, sig.reason)
