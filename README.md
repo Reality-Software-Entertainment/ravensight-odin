@@ -10,7 +10,7 @@ your main loop.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random device id saved per install, no advertising identifier, a saved player opt-out (`set_tracking_enabled`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Odin: tested with `dev-2026-08` (the release CI pins)
-* Version 0.6.1. Shipping a build anyone can download? Read "Public builds" below.
+* Version 0.7.0. Shipping a build anyone can download? Read "Public builds" below.
 
 ## Verification status
 
@@ -31,6 +31,10 @@ What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
   `game_started` and `game_exited`, and the process still exited the way
   the default assertion procedure exits. Not yet seen in the Errors view
   against the real local API.
+* Identify (0.7.0): `odin test ravensight` runs 170 tests, 15 of them on
+  identify against the shared identify vectors through the fake transport
+  (the hash, every refusal, the full sequence, the answers, consent and the
+  key). Not yet run against a live server.
 * The libcurl transport was run end to end against a local mock server:
   settings, session, batch and feedback requests, the playtest header from
   the command line, and the storage file.
@@ -290,6 +294,7 @@ client and does nothing.
 | `write_tracking_enabled(bool, storage_path, consent)` | The same, before a client exists. Pass `.Opt_In` when the client will use it. |
 | `is_tracking_enabled(client)` | False after the player opted out, on this run or an earlier one, or with `.Opt_In` before the yes. |
 | `reset_device_id(client) -> string` | A new saved random id, an empty queue and no session. Returns the new id. With `.Opt_In` and no yes, it forgets the saved id, makes none and returns `""`. |
+| `identify(client, account_id) -> bool`, `reset_identity(client)`, `is_identified(client)` | Links this machine to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
 | `set_enabled(client, bool)` | Turns sending off and on for this run only, like `Config.start_disabled`. Not saved. |
 | `init_reason(client) -> Reason` | Why the client is not sending, or `.None`. `reason_string` gives the text form. |
 | `session_token(client) -> string` | The current session token, `""` until a session opens. |
@@ -564,6 +569,43 @@ A game that sends gameplay events and nothing else can declare Device ID and
 Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
+
+## Identify players who sign in
+
+If your game has its own sign-in, tell Ravensight who signed in so one person
+on two machines, or before and after sign-in, counts as one player:
+
+```odin
+rs.identify(analytics, account.id) // after your sign-in succeeds
+rs.reset_identity(analytics)       // on sign-out
+```
+
+- **What is sent.** Only a hash of the id, keyed with a salt that belongs to
+  your game, and the session token, once per session. The raw id and any
+  email are never sent and never saved. The same account in two games gives
+  two unrelated ids.
+- **Pass an opaque id**, such as your database key or a UUID, never an
+  email, a name or a platform handle. `identify` returns false, logs one
+  warning and does nothing for an id that is empty, longer than 256 UTF-8
+  bytes or contains `@`. The id is used exactly as given, never trimmed.
+- **It lasts.** The hash is saved in the storage file beside the device id
+  (`"identity": {"salt": ..., "accountHash": ...}`) and each later session is
+  identified with no call. Calling `identify` again with the same account
+  does nothing. `is_identified(client)` tells you whether one is set.
+- **Sign-out.** `reset_identity` forgets the saved identity and switches to a
+  fresh device id, like `reset_device_id`, so the next player on this
+  machine is not counted as the last one. Identifying a different account
+  does this first on its own. `reset_device_id` alone keeps the identity.
+- **Consent.** Without a key, or with `.Opt_In` before the player's yes, the
+  id is held in memory only and nothing is sent.
+  `set_tracking_enabled(client, false)` forgets the identity.
+- **Usage.** Each identified session is one event on your usage. Identify
+  never enters the event queue or the queue file and never delays your
+  events. A playtest run never identifies.
+
+Your store privacy form: a game that calls `identify` links Ravensight data
+to the player's account, so declare the data types as linked to the player
+(and a User ID).
 
 ## Telling players
 
