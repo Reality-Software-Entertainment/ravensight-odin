@@ -1,0 +1,396 @@
+{
+  "version": 2,
+  "contract": "docs/identify/CONTRACT.md",
+  "salt": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+  "wire": "lowercase hex HMAC-SHA256, key = the UTF-8 bytes of the salt string exactly as the session answer gives it (64 hex characters, not decoded), message = the UTF-8 bytes of accountId",
+  "player_id": "'px_' + the first 32 characters of wire",
+  "max_bytes": 256,
+  "accept": [
+    {
+      "note": "digits",
+      "accountId": "12345",
+      "wire": "90728679b55680f484c23b06f119e6c3e91f74b51c8b39bda4541cec8b05ae50",
+      "playerId": "px_90728679b55680f484c23b06f119e6c3"
+    },
+    {
+      "note": "a whole number from a dynamic language hashes as its decimal digits",
+      "accountId": 12345,
+      "integer": true,
+      "same_as": "12345",
+      "wire": "90728679b55680f484c23b06f119e6c3e91f74b51c8b39bda4541cec8b05ae50",
+      "playerId": "px_90728679b55680f484c23b06f119e6c3"
+    },
+    {
+      "note": "letters, digits and underscore",
+      "accountId": "user_8f3a",
+      "wire": "f9dae82f8fab3452354bc76feae1c277aebf8fda0c69153cbe966a4b6886d49a",
+      "playerId": "px_f9dae82f8fab3452354bc76feae1c277"
+    },
+    {
+      "note": "accented, 7 UTF-8 bytes",
+      "accountId": "Jürgen",
+      "wire": "4bf9797b3d9daf0e1f5dec47413ff628cf65b384f913a0a7a4d9c72e7b3d3059",
+      "playerId": "px_4bf9797b3d9daf0e1f5dec47413ff628"
+    },
+    {
+      "note": "CJK",
+      "accountId": "玩家一号",
+      "wire": "d083d571357d13968c228420545a17a5dd9da4af287d36cadd0805ac1dd5a0cf",
+      "playerId": "px_d083d571357d13968c228420545a17a5"
+    },
+    {
+      "note": "emoji outside the BMP",
+      "accountId": "🎮player",
+      "wire": "38956c4349cf07de11b4450dfce3dd9d7f9521b184fe9b071272c3cce9753c54",
+      "playerId": "px_38956c4349cf07de11b4450dfce3dd9d"
+    },
+    {
+      "note": "spaces are hashed exactly as given, never trimmed",
+      "accountId": "  spaced  ",
+      "wire": "8692e49f1a749ee1e17d66c0268cf133a16ede64ee785c9f377bd6c091e250dc",
+      "playerId": "px_8692e49f1a749ee1e17d66c0268cf133"
+    },
+    {
+      "note": "a UUID, the recommended shape: an opaque internal id",
+      "accountId": "3f2a9c1e-7b4d-4e8a-9c3f-1a2b3c4d5e6f",
+      "wire": "62feb5d1a32711a726384a7f5b2f8a6f624fa434b82bed37dbcd15e3dd358f9f",
+      "playerId": "px_62feb5d1a32711a726384a7f5b2f8a6f"
+    },
+    {
+      "note": "exactly 256 UTF-8 bytes",
+      "accountId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "wire": "5382aab4628ca536f813cee9f5e2ea2358a1744502bbd5d328433e9e79b9eaad",
+      "playerId": "px_5382aab4628ca536f813cee9f5e2ea23"
+    },
+    {
+      "note": "128 two-byte characters, 256 bytes",
+      "accountId": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "wire": "6176d0c626fa2a301a46ca37ec9a713b9ac2b8b5c9f2668726ef7e8aa2f68832",
+      "playerId": "px_6176d0c626fa2a301a46ca37ec9a713b"
+    },
+    {
+      "note": "longer than the 64-byte HMAC block",
+      "accountId": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+      "wire": "7ecdb3a353a12504a3d4fd7545154539bb28569ee49418400766ed908dcdac59",
+      "playerId": "px_7ecdb3a353a12504a3d4fd7545154539"
+    }
+  ],
+  "refuse": [
+    {
+      "note": "empty",
+      "accountId": "",
+      "reason": "empty"
+    },
+    {
+      "note": "an email address",
+      "accountId": "player@example.com",
+      "reason": "looks_like_email"
+    },
+    {
+      "note": "a handle with @",
+      "accountId": "@handle",
+      "reason": "looks_like_email"
+    },
+    {
+      "note": "trailing @",
+      "accountId": "name@",
+      "reason": "looks_like_email"
+    },
+    {
+      "note": "an email with spaces around it",
+      "accountId": " a@b.co ",
+      "reason": "looks_like_email"
+    },
+    {
+      "note": "257 UTF-8 bytes",
+      "accountId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reason": "too_long"
+    },
+    {
+      "note": "129 two-byte characters, 258 bytes",
+      "accountId": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "reason": "too_long"
+    },
+    {
+      "note": "not a string or whole number",
+      "accountId": null,
+      "reason": "not_text"
+    },
+    {
+      "note": "a fraction is not a whole number",
+      "accountId": 12.5,
+      "reason": "not_text"
+    }
+  ],
+  "sequence": [
+    {
+      "step": "init with a key and consent; identify(\"u1\") before any session opens",
+      "expect": {
+        "sends": [],
+        "stored": null,
+        "held_in_memory": true
+      }
+    },
+    {
+      "step": "session S1 opens; its answer carries identify.salt = salt",
+      "expect": {
+        "sends": [
+          {
+            "session": "S1",
+            "accountHash": "cb90bce4c738902f45b1dca514fe7af9daf20dd489c82519721a500395433eca"
+          }
+        ],
+        "stored": {
+          "salt": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+          "accountHash": "cb90bce4c738902f45b1dca514fe7af9daf20dd489c82519721a500395433eca"
+        }
+      }
+    },
+    {
+      "step": "identify(\"u1\") again in S1",
+      "expect": {
+        "sends": [],
+        "device_changed": false
+      }
+    },
+    {
+      "step": "relaunch, session S2 opens with the same salt, no call",
+      "expect": {
+        "sends": [
+          {
+            "session": "S2",
+            "accountHash": "cb90bce4c738902f45b1dca514fe7af9daf20dd489c82519721a500395433eca"
+          }
+        ]
+      }
+    },
+    {
+      "step": "identify(\"player@example.com\")",
+      "expect": {
+        "refused": "looks_like_email",
+        "sends": [],
+        "stored": {
+          "salt": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+          "accountHash": "cb90bce4c738902f45b1dca514fe7af9daf20dd489c82519721a500395433eca"
+        },
+        "device_changed": false
+      }
+    },
+    {
+      "step": "identify(\"u2\"): another account on this device",
+      "expect": {
+        "device_changed": true,
+        "new_session": "S3",
+        "sends": [
+          {
+            "session": "S3",
+            "accountHash": "a3ced62ed5aae4c6e217709b6ba51824b4513241b124ea7d09769f5e91be05c4"
+          }
+        ],
+        "stored": {
+          "salt": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+          "accountHash": "a3ced62ed5aae4c6e217709b6ba51824b4513241b124ea7d09769f5e91be05c4"
+        }
+      }
+    },
+    {
+      "step": "resetIdentity()",
+      "expect": {
+        "device_changed": true,
+        "new_session": "S4",
+        "sends": [],
+        "stored": null
+      }
+    },
+    {
+      "step": "resetIdentity() again with nothing stored",
+      "expect": {
+        "device_changed": false,
+        "sends": [],
+        "stored": null
+      }
+    },
+    {
+      "step": "identify(\"u3\"), then the answer is 429 needs_funds",
+      "expect": {
+        "sends": [
+          {
+            "session": "S4",
+            "accountHash": "c878eba50da411588aebb771be132993c51aca156762439d85b4cfba3ed78ec0"
+          }
+        ],
+        "stored": {
+          "salt": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+          "accountHash": "c878eba50da411588aebb771be132993c51aca156762439d85b4cfba3ed78ec0"
+        },
+        "retry": "at the next session, never in a loop"
+      }
+    },
+    {
+      "step": "relaunch; session S5 answers a DIFFERENT salt (another game's key)",
+      "expect": {
+        "sends": [],
+        "stored": null,
+        "note": "a stored hash made with another salt is deleted, never sent"
+      }
+    },
+    {
+      "step": "identify(\"u4\"); the session answer carries no identify.salt (older server)",
+      "expect": {
+        "sends": [],
+        "stored": null,
+        "note": "unavailable this launch; the raw id is dropped from memory"
+      }
+    },
+    {
+      "step": "opt out (setEnabled(false) or consent withdrawn)",
+      "expect": {
+        "stored": null,
+        "sends": []
+      }
+    }
+  ],
+  "salts_differ": {
+    "accountId": "12345",
+    "salt_a": "a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40",
+    "wire_a": "90728679b55680f484c23b06f119e6c3e91f74b51c8b39bda4541cec8b05ae50",
+    "salt_b": "0f9e8d7c6b5a49382716f5e4d3c2b1a0ffeeddccbbaa99887766554433221100",
+    "wire_b": "d95abf295a93158597553b373fadbd7d891804b38929f17f72087ea4341f745c"
+  },
+  "server_refuse_hash": [
+    {
+      "accountHash": "",
+      "reason": "invalid_account_hash"
+    },
+    {
+      "accountHash": "CB90BCE4C738902F45B1DCA514FE7AF9DAF20DD489C82519721A500395433ECA",
+      "reason": "invalid_account_hash"
+    },
+    {
+      "accountHash": "cb90bce4c738902f45b1dca514fe7af9daf20dd489c82519721a500395433ec",
+      "reason": "invalid_account_hash"
+    },
+    {
+      "accountHash": "player@example.com",
+      "reason": "invalid_account_hash"
+    }
+  ],
+  "server_budget": {
+    "rule": "at most 3 distinct accepted account hashes per device per UTC day (claimed links only); a refused claim is 429 identify_limited, free, nothing written",
+    "steps": [
+      {
+        "day": "2026-11-19",
+        "session": "S1",
+        "accountHash": "82f1e75fc201541bebbc4dd910896b24103dd0f08f5fee682dc2bce1c0930507",
+        "expect": {
+          "status": 200,
+          "charged": 1,
+          "device_link": "px_82f1e75fc201541bebbc4dd910896b24"
+        }
+      },
+      {
+        "day": "2026-11-19",
+        "session": "S2",
+        "accountHash": "3f6e858f9e8b38923e256b0521cea69b0eb1f887eb0c9232a55e2d8b181f9967",
+        "expect": {
+          "status": 200,
+          "charged": 1,
+          "device_link": "px_3f6e858f9e8b38923e256b0521cea69b"
+        }
+      },
+      {
+        "day": "2026-11-19",
+        "session": "S3",
+        "accountHash": "1b6088330fe26a5e148a3b6602725bae83ded7b010621c7d9033342497f0a484",
+        "expect": {
+          "status": 200,
+          "charged": 1,
+          "device_link": "px_1b6088330fe26a5e148a3b6602725bae"
+        }
+      },
+      {
+        "day": "2026-11-19",
+        "session": "S4",
+        "accountHash": "20c158a5faf262bc0e275cc32ef0712d720fa1ef1453fbb0f7a539935f9310ee",
+        "expect": {
+          "status": 429,
+          "error": "identify_limited",
+          "charged": 0,
+          "device_link": "px_1b6088330fe26a5e148a3b6602725bae"
+        }
+      },
+      {
+        "day": "2026-11-19",
+        "session": "S5",
+        "accountHash": "82f1e75fc201541bebbc4dd910896b24103dd0f08f5fee682dc2bce1c0930507",
+        "expect": {
+          "status": 200,
+          "charged": 1,
+          "device_link": "px_82f1e75fc201541bebbc4dd910896b24",
+          "note": "already within the day's three"
+        }
+      },
+      {
+        "day": "2026-11-20",
+        "session": "S6",
+        "accountHash": "20c158a5faf262bc0e275cc32ef0712d720fa1ef1453fbb0f7a539935f9310ee",
+        "expect": {
+          "status": 200,
+          "charged": 1,
+          "device_link": "px_20c158a5faf262bc0e275cc32ef0712d"
+        }
+      }
+    ]
+  },
+  "server_verified": {
+    "rule": "POST /api/v1/identify/verified, live key only, body { accountHash, sessionToken }: the link is marked verified, outside the claim budget, one player call; a claimed identify never moves a device link that is verified to another player (the session is still stamped)",
+    "steps": [
+      {
+        "call": "verified",
+        "key": "public",
+        "expect": {
+          "status": 403,
+          "error": "live_key_required",
+          "charged": 0
+        }
+      },
+      {
+        "call": "verified",
+        "key": "live",
+        "session": "S1",
+        "accountHash": "df1f0a5a0462b7283af2bf6713f98ce481ee7a2858fbf96c88608e23f9a92622",
+        "expect": {
+          "status": 200,
+          "verified": true,
+          "charged": 1,
+          "device_link": "px_df1f0a5a0462b7283af2bf6713f98ce4"
+        }
+      },
+      {
+        "call": "claimed",
+        "key": "public",
+        "session": "S2",
+        "accountHash": "2df847734c8ea6053049b3038ab57cf1a8a0c9a7a5a963f1844653cf32cd80b7",
+        "expect": {
+          "status": 200,
+          "verified": false,
+          "linked": false,
+          "session_player": "px_2df847734c8ea6053049b3038ab57cf1",
+          "device_link": "px_df1f0a5a0462b7283af2bf6713f98ce4"
+        }
+      },
+      {
+        "call": "claimed",
+        "key": "public",
+        "session": "S3",
+        "accountHash": "df1f0a5a0462b7283af2bf6713f98ce481ee7a2858fbf96c88608e23f9a92622",
+        "expect": {
+          "status": 200,
+          "verified": true,
+          "linked": true,
+          "note": "a claim of the verified player keeps the verified mark"
+        }
+      }
+    ]
+  }
+}
