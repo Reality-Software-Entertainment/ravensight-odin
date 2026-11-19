@@ -295,6 +295,7 @@ client and does nothing.
 | `is_tracking_enabled(client)` | False after the player opted out, on this run or an earlier one, or with `.Opt_In` before the yes. |
 | `reset_device_id(client) -> string` | A new saved random id, an empty queue and no session. Returns the new id. With `.Opt_In` and no yes, it forgets the saved id, makes none and returns `""`. |
 | `identify(client, account_id) -> bool`, `reset_identity(client)`, `is_identified(client)` | Links this machine to your game's own account after sign-in, and forgets it on sign-out. See "Identify players who sign in". |
+| `set_campaign_link(client, link_id) -> bool` | The campaign link id your deep link handler received, sent once with the next session. See "Campaign links". |
 | `set_enabled(client, bool)` | Turns sending off and on for this run only, like `Config.start_disabled`. Not saved. |
 | `init_reason(client) -> Reason` | Why the client is not sending, or `.None`. `reason_string` gives the text form. |
 | `session_token(client) -> string` | The current session token, `""` until a session opens. |
@@ -606,6 +607,58 @@ rs.reset_identity(analytics)       // on sign-out
 Your store privacy form: a game that calls `identify` links Ravensight data
 to the player's account, so declare the data types as linked to the player
 (and a User ID).
+
+## Campaign links
+
+A Ravensight campaign link (`https://go.ravensight.io/...`) that points at a
+web page adds `rs_link=<link id>` to the address it redirects to. Point the
+link at your own https page, the one your deep link, universal link or App
+Link handler already receives, and pass the id on:
+
+```odin
+import "core:strings"
+import rs "ravensight"
+
+// url: the address that opened the game, for example
+// https://play.example.com/open?rs_link=64b0000000000000000000a1
+on_open_url :: proc(analytics: ^rs.Client, url: string) {
+	query := url
+	if i := strings.index_byte(query, '#'); i >= 0 {
+		query = query[:i]
+	}
+	i := strings.index_byte(query, '?')
+	if i < 0 {
+		return
+	}
+	query = query[i + 1:]
+	for param in strings.split_iterator(&query, "&") {
+		if strings.has_prefix(param, "rs_link=") {
+			rs.set_campaign_link(analytics, param[len("rs_link="):])
+			return
+		}
+	}
+}
+```
+
+An install referrer you already read works the same way. The client sends
+the id once, as `campaignLink`, with the next session it opens for the
+player. The server keeps it only when it names a link of the same game, then
+counts the player and the session on the Campaign links page, by link, and
+the players open in Player insights.
+
+- **Checked.** `set_campaign_link` returns true when the id is a link id (24
+  hex characters, any case, sent lower cased) and is now waiting, and false
+  for anything else, which changes nothing. A later valid call replaces one
+  still waiting. Call it before the first session when you can; a call after
+  that goes with the next session the client opens.
+- **Once.** A failed session keeps it for the next attempt. Once the server
+  accepts a session that carried it, it is forgotten, and later sessions (a
+  renewal, a new device id) carry none.
+- **Consent.** The same as everything else: with `.Opt_In` it waits for the
+  player's yes and goes with the first session after it. An opted out
+  player, a client with no key and a playtest run send nothing.
+- **Nothing stored.** It is held in memory only and never written to the
+  storage file. The id is one your studio created, not personal data.
 
 ## Telling players
 

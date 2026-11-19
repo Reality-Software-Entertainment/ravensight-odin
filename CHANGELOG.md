@@ -33,6 +33,10 @@ Needs a Ravensight server that offers identify (the session answer carries
 - Called before this launch's salt is known, the id is held and hashed under
   the salt the session answer brings, even when it matches the stored
   identity; the last call before the salt wins.
+- `set_campaign_link(client, link_id) -> bool` for a campaign link a deep
+  link, universal link, App Link or install referrer handler received. The
+  id goes once, lower cased, as `campaignLink` on the player's next
+  `POST /session`; memory only.
 
 ## [0.6.1] - 2026-11-15
 
