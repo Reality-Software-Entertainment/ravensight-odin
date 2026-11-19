@@ -742,3 +742,7 @@ bytes, which is conservative for non-ASCII text.
 The offline tests validate the actual SDK state machine against fake transport,
 including consent, multipart bytes, retries and credential separation. Production
 uploads, native game captures and non-macOS builds remain unverified.
+
+## Contributing
+
+Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.

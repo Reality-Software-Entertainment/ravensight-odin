@@ -1,0 +1,77 @@
+#!/bin/sh
+# Local gate. GitHub CI runs nightly and on demand only, never on a push or a
+# pull request, so this repository's checks run here before anything leaves
+# the machine, with a time limit, and a failure refuses the push.
+#
+# Install once per clone: git config core.hooksPath .githooks
+#
+# A pushed commit is checked when it is HEAD and the tracked files are clean.
+# A tree that passed is remembered (in the shared git dir), so pushing the same
+# files again, to another remote or after a rebase, does not rerun the checks.
+# Branch deletions and pushes of an already checked tree pass straight through.
+
+LIMIT_SECONDS=900
+
+run_checks() {
+  out=$(mktemp -d)
+  with_limit sh -c "odin test ravensight && odin build examples/minimal -out:\"$out/minimal.bin\" && odin build examples/error_capture -out:\"$out/error_capture.bin\""
+  rc=$?; rm -rf "$out"; return $rc
+}
+
+# Node 24 is the version CI uses; prefer it when the default node differs.
+use_node24() {
+  case "$(node -v 2>/dev/null)" in v24.*) return 0 ;; esac
+  for d in "${NVM_DIR:-$HOME/.nvm}"/versions/node/v24.*/bin /opt/homebrew/opt/node@24/bin /usr/local/opt/node@24/bin; do
+    if [ -x "$d/node" ]; then PATH="$d:$PATH"; export PATH; return 0; fi
+  done
+  echo "pre-push: Node 24 is required (the version CI uses). Install it, for example with: nvm install 24" >&2
+  return 1
+}
+
+# Runs "$@" in its own process group and kills the whole group at the limit.
+with_limit() {
+  perl -e '
+    my $limit = shift @ARGV;
+    my $pid = fork();
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) { setpgrp(0, 0); exec @ARGV; exit 127; }
+    local $SIG{ALRM} = sub {
+      kill "TERM", -$pid; sleep 3; kill "KILL", -$pid;
+      print STDERR "pre-push: checks passed the time limit of $limit seconds.\n";
+      exit 124;
+    };
+    alarm $limit;
+    waitpid($pid, 0);
+    my $s = $?;
+    exit(($s & 127) ? 128 + ($s & 127) : ($s >> 8));
+  ' "$LIMIT_SECONDS" "$@"
+}
+
+root=$(git rev-parse --show-toplevel) || exit 1
+stamps="$(git rev-parse --git-common-dir)/prepush-passed"
+zero=0000000000000000000000000000000000000000
+head_tree=$(git rev-parse "HEAD^{tree}" 2>/dev/null)
+checked=""
+status=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ "$local_sha" = "$zero" ] && continue
+  tree=$(git rev-parse "$local_sha^{tree}" 2>/dev/null) || continue
+  [ -f "$stamps/$tree" ] && continue
+  [ "$tree" = "$checked" ] && continue
+  if [ "$tree" != "$head_tree" ] || ! git -C "$root" diff --quiet HEAD --; then
+    echo "pre-push: $(echo "$local_sha" | cut -c1-8) has not passed the checks. Check it out with a clean tree and push again." >&2
+    status=1
+    continue
+  fi
+  echo "pre-push: running this repository's checks (limit ${LIMIT_SECONDS}s)."
+  if (cd "$root" && run_checks) </dev/null; then
+    mkdir -p "$stamps" && date -u +%Y-%m-%dT%H:%M:%SZ > "$stamps/$tree"
+    checked=$tree
+  else
+    echo "pre-push: checks failed; the push is refused. Fix them and push again." >&2
+    status=1
+  fi
+done
+
+exit $status
