@@ -58,6 +58,9 @@ Server :: struct {
 	identify_status: int,
 	identify_body:  string,
 	hold_identify:  bool, // leave /identify requests open
+	batch_status:   int,  // 0 means 202
+	batch_retry_ms: i64,
+	next_session_body: string, // answers the next /session as is, once
 }
 
 @(private = "file")
@@ -90,12 +93,18 @@ serve :: proc(f: ^Fake, cl: ^Client, s: ^Server) {
 		switch {
 		case path == "/settings":
 			answer(f, idx, 200, `{"trackingEnabled":true}`)
+		case path == "/session" && len(s.next_session_body) > 0:
+			body := s.next_session_body
+			s.next_session_body = ""
+			answer(f, idx, 201, body)
 		case path == "/session":
 			s.sessions += 1
 			extra := len(s.salt) > 0 ? fmt.tprintf(`,"identify":{{"salt":"%s"}}`, s.salt) : ""
 			answer(f, idx, 201, fmt.tprintf(`{{"token":"%s_%d","expiresIn":86400%s}}`, s.token_prefix, s.sessions, extra))
 		case path == "/identify":
 			answer(f, idx, s.identify_status, s.identify_body)
+		case path == "/track/batch" && s.batch_status != 0:
+			answer(f, idx, s.batch_status, `{"error":"rate_limited"}`, s.batch_retry_ms)
 		case path == "/track/batch":
 			answer(f, idx, 202, `{}`)
 		case:
@@ -624,4 +633,225 @@ test_identify_nil_client_is_safe :: proc(t: ^testing.T) {
 	testing.expect(t, !identify(nil, "u1"))
 	reset_identity(nil)
 	testing.expect(t, !is_identified(nil))
+}
+
+// --- Flow review fixes ------------------------------------------------------------
+
+@(private = "file")
+hmac_of :: proc(id, salt: string) -> string {
+	return identify_account_hash(id, salt, context.temp_allocator)
+}
+
+@(private = "file")
+salt_b :: proc(v: Vectors) -> string {
+	differ, _ := v.root["salts_differ"].(json.Object)
+	b, _ := differ["salt_b"].(json.String)
+	return string(b)
+}
+
+// F1: no eager session during a Retry-After hold; the next ordinary session carries it.
+@(test)
+test_identify_no_eager_session_during_a_retry_after :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	cl := fake_client(t, &f, Config{})
+	serve(&f, cl, &s)
+	s.batch_status = 429
+	s.batch_retry_ms = 120_000
+	track(cl, "a")
+	flush(cl)
+	serve(&f, cl, &s)
+	testing.expect_value(t, count_requests(&f, "/session"), 1)
+	s.batch_status = 0
+	reset_device_id(cl) // the session is gone; the hold is not
+	identify(cl, "u1")
+	serve(&f, cl, &s)
+	f.now += 121_000
+	serve(&f, cl, &s)
+	testing.expect_value(t, count_requests(&f, "/session"), 1)
+	tokens, _ := identifies(&f)
+	testing.expect_value(t, len(tokens), 0)
+	track(cl, "b")
+	flush(cl)
+	serve(&f, cl, &s)
+	tokens, _ = identifies(&f)
+	testing.expect_value(t, len(tokens), 1)
+	if len(tokens) == 1 {
+		testing.expect_value(t, tokens[0], "s_2")
+	}
+	close_client(cl)
+}
+
+// F2: the same id before the salt is held and hashed under the salt that arrives.
+@(test)
+test_identify_same_id_before_the_salt_uses_the_new_salt :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "A")
+	cl := fake_client(t, &f, Config{})
+	serve(&f, cl, &s)
+	identify(cl, "u1")
+	serve(&f, cl, &s)
+	close_client(cl)
+	other := salt_b(v)
+	s.salt = other
+	s.token_prefix = "B"
+	cl = fake_client(t, &f, Config{})
+	testing.expect(t, identify(cl, "u1"))
+	serve(&f, cl, &s)
+	_, hashes := identifies(&f)
+	testing.expect_value(t, hashes[len(hashes) - 1], hmac_of("u1", other))
+	saved := load_identity(storage_in(&f), context.temp_allocator)
+	testing.expect_value(t, saved.identity_salt, other)
+	testing.expect_value(t, saved.identity_hash, hmac_of("u1", other))
+	close_client(cl)
+}
+
+// F3: collection or consent back on inside an open session sends the identify.
+@(test)
+test_identify_collection_back_on_sends :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	cl := fake_client(t, &f, Config{})
+	serve(&f, cl, &s)
+	set_enabled(cl, false)
+	testing.expect(t, identify(cl, "u1"))
+	serve(&f, cl, &s)
+	tokens, hashes := identifies(&f)
+	testing.expect_value(t, len(tokens), 0)
+	set_enabled(cl, true)
+	serve(&f, cl, &s)
+	tokens, hashes = identifies(&f)
+	testing.expect_value(t, len(hashes), 1)
+	set_tracking_enabled(cl, false)
+	testing.expect(t, identify(cl, "u2"))
+	set_tracking_enabled(cl, true)
+	serve(&f, cl, &s)
+	tokens, hashes = identifies(&f)
+	testing.expect_value(t, hashes[len(hashes) - 1], hmac_of("u2", v.salt))
+	close_client(cl)
+}
+
+@(private = "file")
+seed_identity :: proc(f: ^Fake, v: Vectors) {
+	os.make_directory_all(f.dir)
+	save_identity(storage_in(f), Saved_Identity{device_id = "dev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", tracking_enabled = true, identity_salt = v.salt, identity_hash = hmac_of("u1", v.salt)})
+}
+
+// F4: before consent, a stored identity is deleted by a decline and by reset_identity.
+@(test)
+test_identify_before_consent_a_stored_identity_is_deleted :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	seed_identity(&f, v)
+	cl := fake_client(t, &f, Config{consent = .Opt_In})
+	set_tracking_enabled(cl, false)
+	testing.expect_value(t, stored_hash(&f), "")
+	close_client(cl)
+
+	seed_identity(&f, v)
+	cl = fake_client(t, &f, Config{consent = .Opt_In})
+	testing.expect(t, is_identified(cl))
+	reset_identity(cl)
+	testing.expect_value(t, stored_hash(&f), "")
+	testing.expect(t, device_id(cl) != "dev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	set_tracking_enabled(cl, true)
+	track(cl, "a")
+	serve(&f, cl, &s)
+	tokens, _ := identifies(&f)
+	testing.expect_value(t, len(tokens), 0)
+	close_client(cl)
+}
+
+// F6: two quick calls before the salt: the last one wins.
+@(test)
+test_identify_last_call_before_the_salt_wins :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	cl := fake_client(t, &f, Config{})
+	identify(cl, "u1")
+	identify(cl, "u2")
+	serve(&f, cl, &s)
+	_, hashes := identifies(&f)
+	testing.expect_value(t, len(hashes), 1)
+	testing.expect_value(t, hashes[0], hmac_of("u2", v.salt))
+	testing.expect_value(t, stored_hash(&f), hmac_of("u2", v.salt))
+	close_client(cl)
+}
+
+// F7: sent on the token the session answer just returned.
+@(test)
+test_identify_sent_on_the_fresh_token :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	s.next_session_body = fmt.tprintf(`{{"token":"fresh","expiresAt":%d,"identify":{{"salt":"%s"}}}}`, f.now / 1000 - 10, v.salt)
+	cl := fake_client(t, &f, Config{disable_lifecycle_events = true})
+	identify(cl, "u1")
+	serve(&f, cl, &s)
+	tokens, _ := identifies(&f)
+	testing.expect(t, len(tokens) >= 1)
+	if len(tokens) >= 1 {
+		testing.expect_value(t, tokens[0], "fresh")
+	}
+	close_client(cl)
+}
+
+// F8: a second no_session in a row stops until a sign-out; other answers reset the count.
+@(test)
+test_identify_second_no_session_stops :: proc(t: ^testing.T) {
+	v := load_vectors(t)
+	f: Fake
+	fake_init(&f)
+	defer fake_destroy(&f)
+	s := server_make(v, "s")
+	no_session := `{"error":"no_session"}`
+	s.identify_status = 400
+	s.identify_body = no_session
+	cl := fake_client(t, &f, Config{})
+	serve(&f, cl, &s)
+	identify(cl, "u1")
+	serve(&f, cl, &s)
+	next_session :: proc(f: ^Fake, cl: ^Client, s: ^Server) {
+		reset_device_id(cl)
+		track(cl, "x")
+		flush(cl)
+		serve(f, cl, s)
+	}
+	next_session(&f, cl, &s)
+	tokens, _ := identifies(&f)
+	testing.expect_value(t, len(tokens), 2)
+	next_session(&f, cl, &s)
+	tokens, _ = identifies(&f)
+	testing.expect_value(t, len(tokens), 2)
+
+	reset_identity(cl) // a sign-out starts over
+	identify(cl, "u2")
+	serve(&f, cl, &s)
+	s.identify_status = 503
+	s.identify_body = `{"error":"unavailable"}`
+	next_session(&f, cl, &s)
+	s.identify_status = 400
+	s.identify_body = no_session
+	next_session(&f, cl, &s)
+	next_session(&f, cl, &s)
+	tokens, _ = identifies(&f)
+	testing.expect_value(t, len(tokens), 6)
+	close_client(cl)
 }
