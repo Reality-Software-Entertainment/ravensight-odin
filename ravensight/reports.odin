@@ -5,9 +5,6 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
 import "core:time"
-// The storage host the API signs uploads for; moves to files.ravensight.io.
-REPORT_STORAGE_HOST_SUFFIX :: ".amazonaws.com"
-REPORT_STORAGE_HOST_MARK :: ".s3"
 
 Report_Input :: struct {
  client_id, message: string,
@@ -20,6 +17,8 @@ Report_Stage :: enum { Begin, Status, Grant, Upload, Finalize }
 // Keep this object alive until its callback; destroy_report refuses pending work.
 Player_Report :: struct {
  payload, png, id, token, device: string,
+ // The host of the first upload address the API returned for this report.
+ upload_host: string,
  client: ^Client,
  pending, uploaded: bool,
  user: rawptr,
@@ -55,7 +54,27 @@ create_report :: proc(input: Report_Input) -> (^Player_Report, string) {
 }
 destroy_report :: proc(report: ^Player_Report) -> bool {
  if report==nil || report.pending {return false}
- delete(report.payload);delete(report.png);delete(report.id);delete(report.token);delete(report.device);free(report);return true
+ delete(report.payload);delete(report.png);delete(report.id);delete(report.token);delete(report.device);delete(report.upload_host);free(report);return true
+}
+// The host of an upload address the API returned, or false when the address
+// is not one a screenshot may go to. No storage host is built in: the address
+// must be https, name a plain host (dotted, not localhost or an address
+// literal) with no user info or port, and carry at most a plain path.
+report_upload_host :: proc(url: string) -> (string, bool) {
+ if len(url)>2048 || !strings.has_prefix(url,"https://") {return "",false}
+ rest:=url[8:]
+ end:=strings.index_byte(rest,'/');if end<0 {end=len(rest)}
+ host,path:=rest[:end],rest[end:]
+ if len(host)==0 || len(host)>253 || !strings.contains(host,".") || strings.contains(host,"..") {return "",false}
+ if host[0]=='.' || host[0]=='-' || host[len(host)-1]=='.' || host[len(host)-1]=='-' {return "",false}
+ literal:=true
+ for c in host {
+  if !(c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='-'||c=='.') {return "",false}
+  if !(c>='0'&&c<='9'||c=='.') {literal=false}
+ }
+ if literal || strings.has_suffix(strings.to_lower(host,context.temp_allocator),".localhost") {return "",false}
+ for c in path {if !(c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='-'||c=='.'||c=='_'||c=='~'||c=='/'||c=='%') {return "",false}}
+ return host,true
 }
 report_active :: proc(cl:^Client,r:^Player_Report)->bool {
  return cl!=nil && core_is_active(&cl.core) && len(cl.core.session_token)>0 && (r.client==nil || r.client==cl && r.token==cl.core.session_token && r.device==cl.device_id)
@@ -88,10 +107,10 @@ report_response :: proc(cl:^Client,t:^Transfer,status:int) {
  if t.report_stage==.Grant {
   url:=report_string(obj,"url")
   // Dedicated HTTPS storage grants only; never send session/ingest/playtest credentials.
-  if !strings.has_prefix(url,"https://") {report_done(r,"","invalid_upload");return}
-  host:=strings.trim_suffix(url[8:],"/")
-  if !strings.has_suffix(host,REPORT_STORAGE_HOST_SUFFIX) || !strings.contains(host,REPORT_STORAGE_HOST_MARK) {report_done(r,"","invalid_upload");return}
-  for c in host {if !(c>='a'&&c<='z'||c>='A'&&c<='Z'||c>='0'&&c<='9'||c=='-'||c=='.'){report_done(r,"","invalid_upload");return}}
+  // A later grant for this report (a retry) must name the host the first one did.
+  host,host_ok:=report_upload_host(url)
+  if !host_ok || r.upload_host!="" && !strings.equal_fold(r.upload_host,host) {report_done(r,"","invalid_upload");return}
+  if r.upload_host=="" {r.upload_host=strings.clone(host)}
   value,has:=obj["fields"];fields,object:=value.(json.Object)
   if !has || !object || len(fields)==0 || len(fields)>30 {report_done(r,"","invalid_upload");return}
   boundary:=fmt.tprintf("ravensight_%s",r.id)
