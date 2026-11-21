@@ -4,7 +4,8 @@
 //
 //   {"deviceId":"dev_<32 hex>","trackingEnabled":true}
 //
-// With Consent.Opt_In the player's yes adds "optIn":true.
+// With Consent.Opt_In the player's yes adds "optIn":true. After identify it
+// also holds "identity":{"salt":...,"accountHash":...}, never the account id.
 //
 // By default it lives at <user data dir>/ravensight/<executable name>/ravensight.json
 // (macOS: ~/Library/Application Support, Windows: %APPDATA%, Linux:
@@ -71,6 +72,8 @@ Saved_Identity :: struct {
 	device_id:        string, // "" when the file has none
 	tracking_enabled: bool,   // true unless the player opted out
 	opted_in:         bool,   // the player's yes for Consent.Opt_In
+	identity_salt:    string, // the stored identity's salt, "" when none
+	identity_hash:    string, // the stored accountHash, "" when none
 	// The file exists but could not be read or parsed. It may hold an
 	// opt-out, so the caller must treat the player as opted out and must not
 	// overwrite it on its own.
@@ -115,6 +118,14 @@ load_identity :: proc(path: string, allocator := context.allocator) -> (saved: S
 			saved.opted_in = bool(b)
 		}
 	}
+	if id, has := obj["identity"].(json.Object); has {
+		salt, salt_ok := id["salt"].(json.String)
+		hash, hash_ok := id["accountHash"].(json.String)
+		if salt_ok && hash_ok && len(salt) > 0 && len(hash) > 0 {
+			saved.identity_salt = strings.clone(string(salt), allocator)
+			saved.identity_hash = strings.clone(string(hash), allocator)
+		}
+	}
 	return
 }
 
@@ -152,6 +163,13 @@ save_identity :: proc(path: string, saved: Saved_Identity) -> bool {
 	if saved.opted_in {
 		strings.write_string(&b, `,"optIn":true`)
 	}
+	if len(saved.identity_salt) > 0 && len(saved.identity_hash) > 0 {
+		strings.write_string(&b, `,"identity":{"salt":`)
+		write_json_string(&b, saved.identity_salt)
+		strings.write_string(&b, `,"accountHash":`)
+		write_json_string(&b, saved.identity_hash)
+		strings.write_byte(&b, '}')
+	}
 	strings.write_byte(&b, '}')
 
 	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
@@ -180,6 +198,11 @@ write_tracking_enabled :: proc(enabled: bool, storage_path := "", consent := Con
 	saved.tracking_enabled = enabled
 	if consent == .Opt_In || !enabled {
 		saved.opted_in = enabled
+	}
+	if !enabled {
+		// Opting out forgets the identity.
+		saved.identity_salt = ""
+		saved.identity_hash = ""
 	}
 	return save_identity(path, saved)
 }

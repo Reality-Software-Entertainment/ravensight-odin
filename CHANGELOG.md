@@ -3,6 +3,41 @@
 All notable changes to the Ravensight Odin SDK. Before 1.0, a minor version
 may break the API.
 
+## [0.7.0] - 2026-11-21
+
+Needs a Ravensight server that offers identify (the session answer carries
+`identify.salt`). Against an older server identify does nothing.
+
+### Added
+
+- `identify(client, account_id) -> bool`, `reset_identity(client)` and
+  `is_identified(client)`, for games with their own sign-in. The id is
+  checked on the device (not empty, at most 256 UTF-8 bytes, no `@`, never
+  trimmed) and refused with `false` and one warning. Only an HMAC-SHA256 of
+  the id, keyed with the game's salt from the session answer, is sent to
+  `POST /api/v1/identify`, once per session, with the key and the session
+  token, as a side request. The raw id is held in memory until the salt is
+  known and is never saved: the storage file gains
+  `"identity":{"salt":...,"accountHash":...}`.
+- A stored identity made under another salt is deleted, never sent. A
+  different account runs `reset_identity` first. `reset_identity` deletes
+  the identity and switches to a fresh device id as `reset_device_id` does;
+  `reset_device_id` alone keeps it. Opting out (`set_tracking_enabled` or
+  `write_tracking_enabled` with false) deletes it.
+- Answers: 200 is done for the session; 404 and `invalid_account_hash` stop
+  identify for the launch, and a second `no_session` in a row stops it until
+  `reset_identity`; every other answer, offline included, waits for the next
+  session. No retry loop. Identify never enters the event queue or the queue
+  file, never opens a session while a Retry-After or backoff holds sending,
+  and never changes the delivery stats.
+- Called before this launch's salt is known, the id is held and hashed under
+  the salt the session answer brings, even when it matches the stored
+  identity; the last call before the salt wins.
+- `set_campaign_link(client, link_id) -> bool` for a campaign link a deep
+  link, universal link, App Link or install referrer handler received. The
+  id goes once, lower cased, as `campaignLink` on the player's next
+  `POST /session`; memory only.
+
 ## [0.6.2] - 2026-11-20
 
 An upload address check no longer hardcodes a host. A screenshot upload goes only to an https address with a plain host name, no user info and no port, and a retry for the same report goes only to the host the API named for it the first time. No API change for games.
