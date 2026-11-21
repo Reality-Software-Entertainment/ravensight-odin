@@ -31,10 +31,12 @@ What has been run, on macOS with Odin `dev-2026-08:8412dc37a`:
   `game_started` and `game_exited`, and the process still exited the way
   the default assertion procedure exits. Not yet seen in the Errors view
   against the real local API.
-* Identify (0.7.0): `odin test ravensight` runs 170 tests, 15 of them on
-  identify against the shared identify vectors through the fake transport
-  (the hash, every refusal, the full sequence, the answers, consent and the
-  key). Not yet run against a live server.
+* Identify and campaign links (0.7.0): `odin test ravensight` runs 193
+  tests, 21 of them on identify against the shared identify vectors through
+  the fake transport (the hash, every refusal, the full sequence, the
+  answers, consent and the key) and 15 on campaign links (the id check, once
+  per accepted session, a link set while a session is in flight, consent,
+  opt out, no key and a playtest run). Not yet run against a live server.
 * The libcurl transport was run end to end against a local mock server:
   settings, session, batch and feedback requests, the playtest header from
   the command line, and the storage file.

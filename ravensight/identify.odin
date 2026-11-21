@@ -62,7 +62,7 @@ identify :: proc(client: ^Client, account_id: string) -> bool {
 	}
 	context.allocator = client.allocator
 	if reason := identify_refusal(account_id); reason != "" {
-		log(client, .Warning, fmt.tprintf("Ravensight: identify refused (%s): pass an opaque account id, 1 to 256 bytes, with no @. Nothing was sent or changed.", reason))
+		log(client, .Warning, fmt.tprintf("Ravensight: identify refused (%s): pass a random account id, 1 to 256 bytes, with no @. Nothing was sent or changed.", reason))
 		return false
 	}
 	if len(client.playtest.token) > 0 {
